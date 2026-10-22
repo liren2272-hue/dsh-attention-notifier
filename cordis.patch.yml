@@ -1,0 +1,62 @@
+- insert:
+    - id: attention-notifier
+      name: '@liren2272/dsh-attention'
+      config:
+        # Which channels fire. `popup` is the reliable one: a topmost
+        # borderless form. `balloon` silently displays nothing under Focus
+        # Assist, and `box` is a modal dialog that strands the session, so
+        # both default off.
+        sound: true
+        popup: true
+        balloon: false
+        box: false
+        # Which events are worth interrupting you for.
+        notifyOnQuestion: true
+        notifyOnApproval: true
+        notifyOnTurnEnd: true
+        includeSummary: true
+        askGuidance: true
+        # Pacing. minIntervalMs collapses bursts (a tool that asks three times
+        # in a row rings once); remindEveryMs/maxReminders re-nag an
+        # unanswered question, then stop.
+        minIntervalMs: 4000
+        remindEveryMs: 120000
+        maxReminders: 3
+        # Clicking a card raises this process's window, so "go deal with it" is
+        # one click. Matched as a process name, not a window title.
+        focusProcess: 'DeepSeek Harness'
+        # And name the session: the click hands a one-shot token to the host
+        # and the page opens the exact session that interrupted you. Set false
+        # for raise-the-window-only.
+        jump: true
+        # Diagnostics. Every listener entry and every ring is appended as a
+        # JSON line, which is how "did it actually fire?" stays answerable.
+        # Set trace: false once you trust it. Read the file as UTF-8.
+        trace: true
+        # How long the card stays on screen, in ms. This is the knob that decides
+        # when the card leaves: 10000 = it dismisses itself after 10 seconds, so
+        # cards never accumulate in the corner. Raise it if you work in another
+        # app and want more time to notice; 0 means it never leaves on a clock and
+        # waits for Esc or a click. The card is topmost and does not take focus,
+        # so a longer value is harmless either way.
+        popupTimeoutMs: 10000
+        # A FLOOR on the visible time, in ms. It only stops a hand-edited tiny
+        # popupTimeoutMs from flashing the card past you before it can be read —
+        # a 300ms card is worse than no card. It never shortens a longer timeout,
+        # and nonsense values are ignored.
+        popupMs: 9000
+        # STACKING. When several cards are on screen at once, later ones retreat
+        # up and to the left of the ones in front (22px right / 18px bottom inset
+        # per step, capped at 3 steps) and draw a darkening wash, so the corner
+        # reads as a stack instead of one card hiding another.
+        #
+        # The step count is computed by the host from how many cards are on
+        # screen — it is NOT a setting here, because only the host can see every
+        # notification (each card is its own process and cannot count its
+        # siblings). It decays automatically: once popupTimeoutMs has passed
+        # since the last card, the stack is considered empty and the next card is
+        # the front one again, so a long day cannot push cards off the screen.
+        #
+        # Set false to disable stacking entirely — every card then sits at the
+        # same corner and the newest one hides the rest.
+        stack: true
