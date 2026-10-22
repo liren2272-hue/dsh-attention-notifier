@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Attention notifier",
+    "description": "Rings a system sound and tray balloon when the agent needs a human decision and when a task ends."
+  }
+}
