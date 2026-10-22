@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Test output
+test/shots/
+test/accent/
+test/chip-preview/
+test/stack-preview/
+test/*-results.txt
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Packaging
+*.tgz
+
+# Trace / notification logs written at runtime
+trace.log
+notify.log
