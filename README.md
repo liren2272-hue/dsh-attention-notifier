@@ -15,9 +15,15 @@ DeepSeek Harness 插件：agent 卡在等你决策时、以及任务结束时，
 | `turn/end` 正常完成 | 蓝色 ·「已完成」 | 任务跑完了 |
 | `turn/end` 出错/中断 | 红色 ·「出错」 | 没交付要求的结果 |
 
-一个没人回答的问题是永远不恢复的任务。所以提问类卡片会按 `remindEveryMs` 重复提醒，最多 `maxReminders` 次。
+**三种色调，各配一种角标字形**（勾 / 感叹号 / 叉）。颜色不是唯一的信号——大约每 12 个男性中有一个分不清这里的蓝和橙——所以每张卡片还带状态词和字形：
 
-颜色不是唯一的信号——大约每 12 个男性中有一个分不清这里的蓝和橙——每张卡片还带一个**状态词**和一个**字形角标**（勾 / 感叹号 / 叉）。
+| 已完成 | 待你决定 | 出错 |
+| :---: | :---: | :---: |
+| ![已完成](docs/screenshots/card-ok.png) | ![待你决定](docs/screenshots/card-ask.png) | ![出错](docs/screenshots/card-alert.png) |
+
+正文里的 Markdown 会渲染：`` `代码` `` 变成带底色的等宽芯片，`**加粗**` 变成粗体。截断也是——超过三行的正文以省略号收尾，而不是把卡片撑高。
+
+一个没人回答的问题是永远不恢复的任务。所以提问类卡片会按 `remindEveryMs` 重复提醒，最多 `maxReminders` 次。
 
 ## 安装
 
@@ -152,6 +158,17 @@ $env:ELECTRON_RUN_AS_NODE = '1'
 `test/run.mjs` 不 spawn 真实 PowerShell——它把生成的脚本从磁盘读回来断言内容，
 所以整套测试在 CI 和无图形界面的机器上都能跑。
 
+### 重新渲染 README 的效果图
+
+`test/render-screenshots.mjs` 用插件自己的 `buildScript` 生成三张卡片（每种色调一张），
+等卡片窗口出现后用 `PrintWindow` 把**卡片本身**（不含桌面背景）截成 PNG：
+
+```bash
+node test/render-screenshots.mjs    # 输出到 docs/screenshots/
+```
+
+截图只包含卡片窗口，因此可以安全地放进公开仓库。
+
 ## 目录结构
 
 ```
@@ -162,7 +179,8 @@ client.js           浏览器半边：轮询 pending 队列，调用 openSession
 cordis.patch.yml    cordis 配置补丁
 icon.svg            插件图标
 locale/             插件在 DSH 设置界面显示的名称与描述（en / zh）
-test/               run.mjs（182 场景）· markdown.mjs · harness.mjs
+docs/screenshots/   README 里的卡片效果图（由 test/render-screenshots.mjs 渲染）
+test/               run.mjs（182 场景）· markdown.mjs · harness.mjs · render-screenshots.mjs
 ```
 
 ## License
