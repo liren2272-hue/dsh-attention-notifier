@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: '@local/dsh-attention',
+  id: '@liren2272/dsh-attention',
   factory(require) {
     'use strict';
     // No React: this half renders nothing. It exists so a desktop card click

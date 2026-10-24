@@ -84,7 +84,7 @@ globalThis.clearTimeout = () => {}
 const source = readFileSync(join(here, '..', 'client.js'), 'utf8')
 new Function(source)()
 check('client.js registers its module', module !== undefined)
-check('the module id matches the package', module?.id === '@local/dsh-attention', String(module?.id))
+check('the module id matches the package', module?.id === '@liren2272/dsh-attention', String(module?.id))
 
 const client = module.factory(() => { throw new Error('client.js must not require anything') })
 check('the client half injects uiWorkspace', JSON.stringify(client.inject) === JSON.stringify(['uiWorkspace']), JSON.stringify(client.inject))

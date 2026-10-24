@@ -1,9 +1,31 @@
 {
-  "name": "@local/dsh-attention",
+  "name": "@liren2272/dsh-attention",
   "version": "1.6.1",
   "private": true,
   "type": "module",
-  "description": "Ring the human when the agent blocks on a decision and when a task ends.",
+  "license": "MIT",
+  "description": "DeepSeek Harness plugin: ring the human when the agent blocks on a decision and when a task ends — desktop cards, click-to-jump, and reminder nudges.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "notification",
+    "attention",
+    "approval",
+    "human-in-the-loop",
+    "windows"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/liren2272-hue/dsh-attention-notifier.git"
+  },
+  "homepage": "https://github.com/liren2272-hue/dsh-attention-notifier#readme",
+  "bugs": {
+    "url": "https://github.com/liren2272-hue/dsh-attention-notifier/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -16,10 +38,16 @@
     "client.js",
     "notify.js",
     "popup.js",
+    "markdown.js",
     "cordis.patch.yml",
     "icon.svg",
+    "README.md",
     "locale/*.json"
   ],
+  "scripts": {
+    "test": "node test/run.mjs",
+    "test:markdown": "node test/markdown.mjs"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -31,5 +59,8 @@
         "@deepseek-ai/dsh-client-ui-workspace"
       ]
     }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
   }
 }

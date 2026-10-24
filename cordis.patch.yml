@@ -1,6 +1,6 @@
 - insert:
     - id: attention-notifier
-      name: '@local/dsh-attention'
+      name: '@liren2272/dsh-attention'
       config:
         # Which channels fire. `popup` is the reliable one: a topmost
         # borderless form. `balloon` silently displays nothing under Focus
