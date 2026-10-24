@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Packaging
+*.tgz
+
+# Runtime logs written by the plugin itself
+trace.log
+notify.log
+*.log
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Backups taken before an edit
+*.bak
+*.bak-*
+
+# Test scratch output
+test/shots/
+test/accent/
+test/chip-preview/
+test/stack-preview/
+test/*-results.txt
+.screenshot-scratch/

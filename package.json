@@ -1,0 +1,35 @@
+{
+  "name": "@local/dsh-attention",
+  "version": "1.6.1",
+  "private": true,
+  "type": "module",
+  "description": "Ring the human when the agent blocks on a decision and when a task ends.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./popup": "./popup.js",
+    "./icon": "./icon.svg",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "notify.js",
+    "popup.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  }
+}
