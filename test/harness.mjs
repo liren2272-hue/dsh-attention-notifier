@@ -6,7 +6,7 @@
  * pending human answer can be modelled: the real answerer only resolves once the
  * human replies, and the notifier must keep nudging until then.
  */
-export function createHarness({ agents = [], webServer = 'default', connection = null, tools = null, initiator = undefined } = {}) {
+export function createHarness({ agents = [], webServer = 'default', connection = null, tools = null, initiator = undefined, sessions = null } = {}) {
   const listeners = new Map()
   const timers = []
   const logs = { info: [], warn: [] }
@@ -129,6 +129,15 @@ export function createHarness({ agents = [], webServer = 'default', connection =
         return { section: (entry) => sections.push(entry) }
       }
       if (name === 'connection') return connection
+      // The session store: the card reads each conversation's NAME off its
+      // `session/title` log event. `sessions` is either a map of id -> event log
+      // (the shape tests want to write) or an object with a `get` already (the
+      // shape the host exposes), so both read the same way to the plugin.
+      if (name === 'sessions') {
+        if (sessions === null) return undefined
+        if (typeof sessions.get === 'function') return sessions
+        return { get: (id) => (Object.hasOwn(sessions, id) ? { id, log: sessions[id] } : undefined) }
+      }
       return undefined
     },
   }

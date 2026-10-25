@@ -386,7 +386,19 @@ export function buildScript(cfg, title, body, tone = 'ok') {
     // any of them would put that element out of line with the text.
     lines.push('$padR=[int](28*$k)')
     lines.push('$lw=$w-$tx-$padR')
-    lines.push('$lineH=[int]$bf.GetHeight($gfx)')
+    // EVERY LINE BOX IS CEILED, NEVER TRUNCATED.
+    //
+    // `[int]` truncates, so a font whose line height is 19.3px got a 19px box —
+    // one pixel short of the line it has to hold. With `LineLimit` set, GDI+
+    // then refuses to paint that line AT ALL, and the failure is not even
+    // uniform: Latin text still draws (its ascender/descender box fits in 19),
+    // while CJK draws NOTHING, because a CJK glyph needs the full em box. So a
+    // card with an English headline and a Chinese one behaved differently for
+    // no visible reason, and a Chinese product name vanished from the eyebrow
+    // while "DeepSeek Harness" survived. `[Math]::Ceiling` makes the box at
+    // least the line height at every DPI scale, which is what the comment on
+    // $headH below was always trying to say.
+    lines.push('$lineH=[int][Math]::Ceiling($bf.GetHeight($gfx))')
     // The body is capped at three lines: a notification is a glance, and a card
     // that grows to fit a paragraph stops being glanceable. Two lines minimum so
     // a one-line message still has the same resting shape.
@@ -424,20 +436,34 @@ export function buildScript(cfg, title, body, tone = 'ok') {
     lines.push(`}`)
     lines.push('$need=$simLines*$lineH')
     lines.push('$bodyH=[Math]::Max($lineH*2,[Math]::Min($need,$lineH*3))')
-    lines.push('$headH=[int]$hf.GetHeight($gfx)')
-    lines.push('$brandH=[int]$sf.GetHeight($gfx)')
+    lines.push('$headH=[int][Math]::Ceiling($hf.GetHeight($gfx))')
+    // Same ceiling rule as $lineH above, and here it is not theoretical: at
+    // 150% DPI the eyebrow font's line height is 19.30px, `[int]` made that 19,
+    // and a 19px box with LineLimit paints a CJK string as NOTHING while still
+    // painting a Latin one. The product label is a CJK-capable string, so this
+    // is the line that made the eyebrow vanish.
+    lines.push('$brandH=[int][Math]::Ceiling($sf.GetHeight($gfx))')
     lines.push('$chipH=[int](24*$k)')
     lines.push('$eyebrowH=[Math]::Max($brandH,$chipH)')
     lines.push('$headY=$padTop+$eyebrowH+[int](5*$k)')
     lines.push('$bodyY=$headY+$headH+[int](5*$k)')
-    // The eyebrow's left slot is the PRODUCT name (config `title`, e.g. "DeepSeek
-    // Harness"), never the card's own headline. `$title` holds the headline, so
-    // the brand string has to be passed in separately — reusing `$title` there
-    // printed the headline twice.
-    // The eyebrow carries the conversation name, not the fixed product label:
-    // `cfg.brand` is threaded in from index.js (resolved from the session), and
-    // falls back to the configured title so the row still reads sensibly when the
-    // host does not expose a name.
+    // TWO different strings live on the top row and the headline row, and they
+    // are deliberately not the same thing:
+    //
+    //   $brandName  the PRODUCT label — config `brand`, defaulting to
+    //               "DeepSeek Harness". Small, muted, above the headline.
+    //   $title      the HEADLINE — the conversation's name, resolved from the
+    //               session's `session/title` event by index.js. Bold.
+    //
+    // The two were once the same value (the fixed product label was printed as
+    // the headline, and the eyebrow slot was fed the headline), which made the
+    // card say "DeepSeek Harness" twice and never name the conversation. They
+    // are now separate inputs: `cfg.brand` for the eyebrow, the `title`
+    // argument for the headline.
+    //
+    // `cfg.brand` still falls back through `cfg.title` because an older profile
+    // patch only knows `title`; that keeps the eyebrow populated instead of
+    // blank on a config written before this split.
     lines.push(`$brandName='${String(cfg.brand ?? cfg.title ?? 'DeepSeek Harness').replace(/'/g, "''")}'`)
     // The bottom band holds the countdown hairline and must clear the body's last
     // line. 17 was too tight once three lines were actually reachable: the hairline
@@ -606,28 +632,22 @@ export function buildScript(cfg, title, body, tone = 'ok') {
     lines.push('  $gr.ScaleTransform($gs,$gs)')
     lines.push('  $gr.FillPath($gb,$badgePath)')
     lines.push('  $gr.Restore($gst)')
-    // eyebrow: brand name, then the status chip on the right.
+    // ---- top row: product eyebrow on the left, status chip on the right ----
     //
-    // The brand sits on the SAME row as the status chip, so it must never run
-    // under the "已完成"/"待你决定" box. It is clamped to the gap between the
-    // text column's left edge ($tx) and the chip's left edge ($cx), minus a
-    // small breathing gap, and rendered with EllipsisCharacter so a long
-    // conversation name is trimmed with "…" right at the box instead of
-    // overlapping it. Height is the single-line brand height with LineLimit, so
-    // it is always one row — never two.
-    lines.push('  $sb=New-Object System.Drawing.SolidBrush($script:cBrand)')
-    lines.push('  $bw=[int]($cx-$tx-[int](8*$k))')
-    lines.push('  if($bw -lt [int](12*$k)){ $bw=[int](12*$k) }')
-    lines.push('  $bft=New-Object System.Drawing.StringFormat')
-    lines.push('  $bft.Trimming=[System.Drawing.StringTrimming]::EllipsisCharacter')
-    lines.push('  $bft.FormatFlags=[System.Drawing.StringFormatFlags]::LineLimit')
-    lines.push('  $gr.DrawString($brandName,$sf,$sb,(New-Object System.Drawing.RectangleF($tx,($padTop+($eyebrowH-$brandH)/2),$bw,$brandH)),$bft)')
-    lines.push('  $bft.Dispose()')
-    lines.push('  $tw=$gr.MeasureString($script:statusText,$cf).Width')
-    // The status chip's internal spacing. The old formula (`tw+18`) left ONE
-    // pixel between the text and the right edge, because 17 of those 18px was
-    // spent positioning the text after the dot — so "待你决定" sat hard against
-    // the border and read as cramped. The padding is now stated as the space
+    // THE CHIP IS MEASURED FIRST, and that order is load-bearing. Both the
+    // eyebrow and the headline are clamped to the chip's left edge ($cx), so
+    // $cx has to exist before either is drawn. It used to be computed AFTER the
+    // eyebrow, which meant `$cx - $tx - 8k` evaluated against an unset variable:
+    // PowerShell treats that as 0, the subtraction went negative, the clamp
+    // below turned it into the 12px floor, and the brand line was drawn into a
+    // sliver too narrow for a single glyph. The result was an eyebrow that
+    // occupied its row but painted nothing — which is exactly what "the small
+    // DeepSeek Harness text disappeared" looked like.
+    //
+    // The chip's internal spacing. The old formula (`tw+18`) left ONE pixel
+    // between the text and the right edge, because 17 of those 18px was spent
+    // positioning the text after the dot — so "待你决定" sat hard against the
+    // border and read as cramped. The padding is now stated as the space
     // actually wanted on each side of the dot-and-text group:
     //
     //   10  left edge   -> dot
@@ -636,11 +656,28 @@ export function buildScript(cfg, title, body, tone = 'ok') {
     //
     // which is `dot(6) + 6 + text + 10` from the left edge, i.e. the text starts
     // at 22 and the chip is `tw + 32` wide. The right edge stays pinned to
-    // $w-$padR, so it remains flush with the text column, the title and the
-    // countdown hairline.
+    // $w-$padR, so it remains flush with the text column and the countdown
+    // hairline.
+    lines.push('  $tw=$gr.MeasureString($script:statusText,$cf).Width')
     lines.push('  $cw=$tw+[int](32*$k)')
     lines.push('  $cx=$w-$padR-$cw')
     lines.push('  $cy=$padTop+($eyebrowH-$chipH)/2')
+    // eyebrow: the PRODUCT label, never the headline.
+    //
+    // It shares its row with the chip, so it is clamped to the gap between the
+    // text column's left edge ($tx) and the chip's left edge ($cx), minus a
+    // small breathing gap, and rendered with EllipsisCharacter so a long product
+    // name is trimmed with "…" at the box instead of running under the chip.
+    // Height is the single-line brand height with LineLimit, so it is always one
+    // row — never two.
+    lines.push('  $sb=New-Object System.Drawing.SolidBrush($script:cBrand)')
+    lines.push('  $bw=[int]($cx-$tx-[int](8*$k))')
+    lines.push('  if($bw -lt [int](12*$k)){ $bw=[int](12*$k) }')
+    lines.push('  $bft=New-Object System.Drawing.StringFormat')
+    lines.push('  $bft.Trimming=[System.Drawing.StringTrimming]::EllipsisCharacter')
+    lines.push('  $bft.FormatFlags=[System.Drawing.StringFormatFlags]::LineLimit')
+    lines.push('  $gr.DrawString($brandName,$sf,$sb,(New-Object System.Drawing.RectangleF($tx,($padTop+($eyebrowH-$brandH)/2),$bw,$brandH)),$bft)')
+    lines.push('  $bft.Dispose()')
     lines.push('  $cp=RR $cx $cy $cw $chipH ([int]($chipH/2))')
     lines.push('  $gr.FillPath($tb,$cp)')
     lines.push('  $gr.DrawPath($tpen,$cp)')
@@ -648,17 +685,26 @@ export function buildScript(cfg, title, body, tone = 'ok') {
     lines.push('  $gr.FillEllipse($gb,($cx+[int](10*$k)),($cy+$chipH/2-$db/2),$db,$db)')
     lines.push('  $ctb=New-Object System.Drawing.SolidBrush($script:tintText)')
     lines.push('  $gr.DrawString($script:statusText,$cf,$ctb,($cx+[int](22*$k)),($cy+($chipH-$gr.MeasureString($script:statusText,$cf).Height)/2))')
-    // title
+    // ---- headline: the conversation's name, one line, ellipsised ----
     //
     // Drew unbounded before, which meant a long title simply ran past the card's
     // right edge and got clipped by the window Region — text hitting the edge is
-    // exactly the crowding this change is about, so it gets the same ellipsis box
-    // the body has.
+    // exactly the crowding this change is about.
+    //
+    // The box width is `$tw2`, NOT the full text column `$lw`. The chip sits on
+    // the row above and is pinned to the right edge, so a headline laid out to
+    // `$lw` ran its last characters directly underneath the "已完成" chip: no
+    // pixel overlapped, but the text visibly collided with the badge, which is
+    // how it was reported. Ending the headline at the chip's left edge (minus a
+    // 12px gap) makes the two columns line up and leaves the badge clear at any
+    // title length.
     lines.push('  $tb2=New-Object System.Drawing.SolidBrush($script:cTitle)')
     lines.push('  $tfmt=New-Object System.Drawing.StringFormat')
     lines.push('  $tfmt.Trimming=[System.Drawing.StringTrimming]::EllipsisCharacter')
     lines.push('  $tfmt.FormatFlags=[System.Drawing.StringFormatFlags]::LineLimit')
-    lines.push('  $gr.DrawString($title,$hf,$tb2,(New-Object System.Drawing.RectangleF($tx,$headY,$lw,$headH)),$tfmt)')
+    lines.push('  $tw2=[int]($cx-$tx-[int](12*$k))')
+    lines.push('  if($tw2 -lt [int](40*$k)){ $tw2=$lw }')
+    lines.push('  $gr.DrawString($title,$hf,$tb2,(New-Object System.Drawing.RectangleF($tx,$headY,$tw2,$headH)),$tfmt)')
     lines.push('  $tfmt.Dispose()')
     // body, trimmed to the three-line box
     lines.push('  $fmt=New-Object System.Drawing.StringFormat')

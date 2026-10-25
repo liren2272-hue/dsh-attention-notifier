@@ -90,7 +90,15 @@ const DEFAULTS = {
   remindEveryMs: 120_000,
   maxReminders: 3,
   soundFile: 'C:\\Windows\\Media\\notify.wav',
+  // Fallback headline: used only when the conversation has no name yet (a
+  // brand-new session before its first `session/title` event). The headline
+  // normally names the conversation.
   title: 'DeepSeek Harness',
+  // The small muted product line ABOVE the headline. Separate from `title`
+  // because the headline is now the conversation's name, so the product label
+  // needs a setting of its own — with the two sharing one field there was
+  // nothing left to print in the eyebrow slot and it rendered blank.
+  brand: 'DeepSeek Harness',
   powershell: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
   // Process name whose window is raised when the card is clicked. Matched
   // against `Get-Process -Name`, so it is the friendly process name, not the
@@ -368,41 +376,46 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * Resolve the eyebrow/headline text for a card from the live conversation.
+   * Resolve the conversation's NAME for a card from the live session.
    *
-   * The card's top row (beside the "已完成"/"待你决定" chip) and the bold
-   * headline used to read the fixed product label "DeepSeek Harness". They now
-   * show the current conversation's name instead. The host keeps that name as a
-   * `session/title` log event on the session, so we read it off
-   * `ctx.sessions.get(id).log`; fall back to the configured title (which itself
-   * falls back inside notify.js to "DeepSeek Harness") when the service is
-   * absent, the session id is missing, or no title has been recorded yet.
+   * The card's headline used to print the fixed product label "DeepSeek
+   * Harness", which told the user nothing when three conversations were open.
+   * The host keeps each conversation's name as a `session/title` log event on
+   * the session (written by the session-title providers, and by the user's own
+   * rename), so we read the latest one off `ctx.sessions.get(id).log`.
+   *
+   * Returns '' when there is nothing to show, and the caller falls back to the
+   * configured label. That is the honest failure: a card headed "DeepSeek
+   * Harness" is still readable, whereas an empty headline row is a hole in the
+   * layout.
    *
    * Defensive by design: every access is optional-chained and wrapped in
    * try/catch, because a notification is the wrong place to throw — a broken
    * resolver must never silence the card.
    *
    * @param {string|undefined} sessionId
-   * @returns {string} the conversation name, or '' to let notify.js fall back.
+   * @returns {string} the conversation name, or '' to let the caller fall back.
    */
-  function resolveBrand(sessionId) {
-    if (sessionId !== undefined && sessionId !== null && sessionId !== '') {
-      try {
-        const sessions = ctx.get?.('sessions')
-        const session = sessions?.get?.(sessionId)
-        const log = session?.log
-        if (Array.isArray(log)) {
-          for (let i = log.length - 1; i >= 0; i -= 1) {
-            const event = log[i]
-            if (event?.type === 'session/title') {
-              const value = event?.data?.title ?? event?.data?.name ?? event?.data?.text
-              if (typeof value === 'string' && value.trim() !== '') return value.trim()
-            }
+  function resolveSessionName(sessionId) {
+    if (sessionId === undefined || sessionId === null || sessionId === '') return ''
+    try {
+      const sessions = ctx.get?.('sessions')
+      const session = sessions?.get?.(sessionId)
+      const log = session?.log
+      if (Array.isArray(log)) {
+        // Last-wins: a conversation can be renamed, and the newest
+        // `session/title` event is the name the user currently sees in the
+        // workspace list. Scanning backwards stops at the first hit.
+        for (let i = log.length - 1; i >= 0; i -= 1) {
+          const event = log[i]
+          if (event?.type === 'session/title') {
+            const value = event?.data?.title ?? event?.data?.name ?? event?.data?.text
+            if (typeof value === 'string' && value.trim() !== '') return value.trim()
           }
         }
-      } catch (error) {
-        once('resolveBrand-threw', 'resolveBrand-threw', { sessionId, error: String(error) })
       }
+    } catch (error) {
+      once('resolveSessionName-threw', 'resolveSessionName-threw', { sessionId, error: String(error) })
     }
     return ''
   }
@@ -425,6 +438,20 @@ export function apply(ctx, rawConfig) {
       // under it), so that is the lifetime the token has to cover.
       jumpUrl = offerJump(sessionId, jumpTtlFor(Math.max(cfg.popupTimeoutMs, cfg.popupMs)))
     }
+    // THE HEADLINE NAMES THE CONVERSATION, not the product.
+    //
+    // Every call site below passes `cfg.title` — the fixed product label — as
+    // `title`, because that label is the right answer when nothing better is
+    // known. But when the host has a name for this conversation, that name is
+    // strictly more useful: the user with four windows open needs to know
+    // WHICH one finished, and "DeepSeek Harness" appears on all four. So the
+    // session's own name wins and the configured label is only the fallback.
+    //
+    // The product label is not lost: it moves to the small eyebrow line above
+    // the headline (`brand` below), which is where it belongs on a card that
+    // has both.
+    const sessionName = resolveSessionName(sessionId)
+    const headline = sessionName !== '' ? sessionName : title
     // Claim the next ordinal in the stack. `stackCount` is how many cards are
     // already on screen, so the new one takes that value (0 = the front card,
     // 1 = the first retreat, ...) and the count then grows by one.
@@ -442,8 +469,9 @@ export function apply(ctx, rawConfig) {
     // stack. The ordinal is still counted and still decays, so re-enabling
     // stacking later resumes from a live count instead of a stale one.
     const handOff = cfg.stack === false ? undefined : stackIndex
-    write('notify', { title, body, tone, jump: jumpUrl !== undefined, stackIndex: handOff })
-    return ring(jumpUrl === undefined ? cfg : { ...cfg, jumpUrl, stackIndex: handOff }, title, body, ctx.logger, tone)
+    write('notify', { title: headline, brand: cfg.brand, body, tone, jump: jumpUrl !== undefined, stackIndex: handOff })
+    const settings = { ...cfg, brand: cfg.brand, ...(jumpUrl === undefined ? {} : { jumpUrl, stackIndex: handOff }) }
+    return ring(settings, headline, body, ctx.logger, tone)
   }
 
   /**
@@ -816,7 +844,7 @@ export function apply(ctx, rawConfig) {
                 enum: Object.keys(POPUP_PRESETS),
                 description: 'Canned sample to show, with markup chosen to exercise every branch of the painter. Its title, body and tone are used for any field not passed explicitly.',
               },
-              title: { type: 'string', description: 'Card heading. Defaults to the preset heading, else the configured title.' },
+              title: { type: 'string', description: 'Card heading. Defaults to the preset heading, else this conversation\'s name.' },
               body: { type: 'string', description: 'Card text, Markdown-capable (bold, inline code, links, bullet lists). Defaults to the preset body.' },
               tone: {
                 type: 'string',
@@ -845,6 +873,28 @@ export function apply(ctx, rawConfig) {
               ? undefined
               : exec?.agent?.id ?? ctx.get?.('agents')?.currentInitiator?.()?.id
             delete options.jump
+            // A test card should look like the card it is standing in for, and
+            // the real cards are headed by the conversation's name. So when the
+            // caller did not name a heading, borrow the session's — otherwise
+            // the seam would preview a headline no real card ever shows, and
+            // "does the card name the right conversation" would be the one
+            // thing the tool could not answer.
+            //
+            // The session name beats the PRESET heading on purpose. A preset is
+            // a canned sample for the painter's markup, and its heading
+            // ("弹窗测试 · 完成") is a label for the sample, not a heading any
+            // real card would ever print. Keeping it would make the one card
+            // you fire to check delivery the one card that does not name its
+            // conversation. An explicit `title` still wins, which keeps the
+            // tool usable for previewing arbitrary text.
+            //
+            // The session is resolved independently of `jump`: a preview with
+            // `jump: false` still belongs to this conversation, it just cannot
+            // be clicked.
+            if (options.title === undefined) {
+              const named = resolveSessionName(exec?.agent?.id ?? ctx.get?.('agents')?.currentInitiator?.()?.id)
+              if (named !== '') options.title = named
+            }
             // The token table lives beside the route that consumes it, so it is
             // handed to popup() as a minter instead of imported there: that keeps
             // popup.js host-free and directly testable, and keeps the expiry rule

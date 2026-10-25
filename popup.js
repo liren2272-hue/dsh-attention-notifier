@@ -78,6 +78,12 @@ export function resolvePopup(cfg = {}, options = {}) {
   const preset = typeof options.preset === 'string' ? POPUP_PRESETS[options.preset] : undefined
   return {
     title: asText(options.title, preset?.title ?? asText(cfg.title, 'DeepSeek Harness')),
+    // The small product line above the headline. It is resolved here as well as
+    // in the card painter so a caller can see what the eyebrow will say without
+    // rendering anything — and so `brand` survives into `effective` below, which
+    // is what actually carries it to notify.js. Falls back to the configured
+    // title for a profile written before the two fields were split apart.
+    brand: asText(options.brand, asText(cfg.brand, asText(cfg.title, 'DeepSeek Harness'))),
     body: asText(options.body, preset?.body ?? ''),
     tone: normalizeTone(options.tone ?? preset?.tone),
     timeoutMs: clampTimeout(options.durationMs ?? options.timeoutMs, clampTimeout(cfg.popupTimeoutMs, 10_000)),
@@ -150,6 +156,10 @@ export function popup(cfg = {}, options = {}, logger) {
     balloon: false,
     box: false,
     sound: request.sound,
+    // The eyebrow must come from the resolved value, not straight from cfg: a
+    // caller may override it per card, and `request.brand` is the field that
+    // already folded that override in.
+    brand: request.brand,
     popupTimeoutMs: request.timeoutMs,
     stackIndex: options.stackIndex,
     jumpUrl,

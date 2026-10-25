@@ -64,11 +64,23 @@ function makeRings() {
  * feature with thousands of lines that were never delivered to anyone. Scenarios
  * that test the trace pass their own `traceFile` and win by spreading after this.
  */
-function setup({ config = {}, agents = [], tools = null, initiator = undefined } = {}) {
+function setup({ config = {}, agents = [], tools = null, initiator = undefined, sessions = null } = {}) {
   const { rings, spawn } = makeRings()
-  const harness = createHarness({ agents, tools, initiator })
+  const harness = createHarness({ agents, tools, initiator, sessions })
   apply(harness.ctx, { spawn, logFile: '', trace: false, ...config })
   return { harness, rings }
+}
+
+/**
+ * The card's headline, as it was handed to the painter.
+ *
+ * `buildScript` embeds the headline as the FIRST `FromBase64String` call and the
+ * body as the last, so a test can read back exactly what the user would see
+ * without running PowerShell.
+ */
+function decodeTitle(script) {
+  const matches = [...script.matchAll(/FromBase64String\('([^']+)'\)/g)]
+  return Buffer.from(matches[0]?.[1] ?? '', 'base64').toString('utf8')
 }
 
 // ---- 1. script shape -------------------------------------------------------
@@ -471,12 +483,26 @@ function setup({ config = {}, agents = [], tools = null, initiator = undefined }
   // real fonts so line boxes cannot be too short at any scale factor.
   check(
     'the title line box is derived from its font',
-    script.includes('$headH=[int]$hf.GetHeight($gfx)'),
+    script.includes('$headH=[int][Math]::Ceiling($hf.GetHeight($gfx))'),
   )
   check(
     'the body line box is derived from its font',
-    script.includes('$lineH=[int]$bf.GetHeight($gfx)'),
+    script.includes('$lineH=[int][Math]::Ceiling($bf.GetHeight($gfx))'),
   )
+  // A line box must be CEILED, not truncated. `[int]` on a 19.30px line height
+  // gives a 19px box, one pixel short of the line it must hold — and under
+  // `LineLimit` GDI+ then paints that line as NOTHING. Worse, it fails by
+  // script: Latin still draws (its ascender/descender fits) while CJK draws
+  // nothing, so an English eyebrow survived and a Chinese one vanished with no
+  // other visible difference. Every GetHeight() line box has to be ceiled.
+  {
+    const boxes = [...script.matchAll(/\$(lineH|headH|brandH)=\[int\](.*)/g)]
+    check(
+      'every line box is ceiled, not truncated',
+      boxes.length >= 3 && boxes.every(([, , rest]) => rest.startsWith('[Math]::Ceiling(')),
+      JSON.stringify(boxes.map(([all]) => all.trim())),
+    )
+  }
   check(
     'the card height follows the message',
     // The height comes from SIMULATING the walk: the same character-by-character
@@ -568,10 +594,48 @@ function setup({ config = {}, agents = [], tools = null, initiator = undefined }
   )
   check('the countdown hairline spans the content, so it ends at the text margin',
     script.includes('RR $padX $ty ($w-$padX-$padR)'))
-  // A long title must ellipsise rather than run into the edge.
-  check('a long title is trimmed to the text column',
-    script.includes('$gr.DrawString($title,$hf,$tb2,(New-Object System.Drawing.RectangleF($tx,$headY,$lw,$headH)),$tfmt)') &&
+  // A long headline must ellipsise rather than run into the edge.
+  check('a long headline is trimmed to the text column',
+    script.includes('$gr.DrawString($title,$hf,$tb2,(New-Object System.Drawing.RectangleF($tx,$headY,$tw2,$headH)),$tfmt)') &&
       !script.includes('$gr.DrawString($title,$hf,$tb2,$tx,$headY)'))
+  // The headline's box must END AT THE CHIP, not at the card's right margin.
+  //
+  // The bug this locks out: the headline was laid out to the full text column
+  // `$lw`, which runs to the same right edge the "已完成" chip is pinned to — so
+  // a long conversation name put its last characters directly under the chip.
+  // No pixel overlapped, but the text visibly collided with the badge. `$tw2` is
+  // derived from the chip's own left edge ($cx) minus a 12px gap, so the two
+  // columns line up at every title length.
+  check('the headline stops short of the status chip',
+    script.includes('$tw2=[int]($cx-$tx-[int](12*$k))') &&
+      // ...and the clamp must still fall back to the full column when the chip
+      // is so wide that the remaining box could not hold a word: a sliver of a
+      // headline is worse than a slightly crowded one.
+      script.includes('if($tw2 -lt [int](40*$k)){ $tw2=$lw }'),
+  )
+  // THE EYEBROW ORDERING GUARD.
+  //
+  // `$bw` is `$cx - $tx - 8k`, so the chip's left edge has to be computed
+  // BEFORE the eyebrow is drawn. When the eyebrow came first, PowerShell read
+  // the unset `$cx` as 0, the subtraction went negative, the 12px floor took
+  // over, and the product line was painted into a sliver too narrow for one
+  // glyph — an eyebrow that occupied its row and showed nothing, which read as
+  // "the small DeepSeek Harness line disappeared".
+  check('the chip is measured before the eyebrow that depends on it',
+    script.indexOf('$cx=$w-$padR-$cw') < script.indexOf('$bw=[int]($cx-$tx-'),
+  )
+  check('the eyebrow is clamped to the chip and ellipsised',
+    script.includes('$bw=[int]($cx-$tx-[int](8*$k))') &&
+      script.includes('$bft.Trimming=[System.Drawing.StringTrimming]::EllipsisCharacter') &&
+      script.includes('$bft.FormatFlags=[System.Drawing.StringFormatFlags]::LineLimit') &&
+      script.includes('$gr.DrawString($brandName,$sf,$sb,'),
+  )
+  // The eyebrow is the PRODUCT line and the headline is the CONVERSATION — two
+  // different strings. Sharing one variable is what printed "DeepSeek Harness"
+  // as the headline on every card.
+  check('the eyebrow paints the brand, never the headline',
+    script.includes('$brandName=') && !script.includes('$gr.DrawString($title,$sf,'),
+  )
   // Every glyph, tile, chip and hairline now comes from one Paint handler.
   check('the card is drawn by a single Paint handler', script.includes('$f.Add_Paint({'))
   check(
@@ -1748,6 +1812,141 @@ function setup({ config = {}, agents = [], tools = null, initiator = undefined }
     rmSync(traceFile, { force: true })
   } catch {
     /* best effort */
+  }
+}
+
+// ---- 30. the card names the conversation ----------------------------------
+//
+// The headline used to be the fixed product label "DeepSeek Harness", which is
+// the same string on every card and therefore identifies nothing when several
+// windows are open. It is now the conversation's own name — the text the
+// workspace list shows — read off the session's newest `session/title` event.
+// The product label moved up to the small eyebrow line, so a card says BOTH
+// which app it came from and which conversation it is about.
+{
+  const titled = (title, extra = []) => [
+    ...extra,
+    { type: 'session/title', data: { title, messageSeqs: [], source: 'user' } },
+  ]
+
+  {
+    const { harness, rings } = setup({
+      config: { minIntervalMs: 0 },
+      sessions: { s1: titled('修复通知卡片的标题重叠') },
+    })
+    harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+    check('the headline is the conversation name, not the product label',
+      decodeTitle(rings[0]?.script ?? '') === '修复通知卡片的标题重叠',
+      JSON.stringify(decodeTitle(rings[0]?.script ?? '')))
+    // The eyebrow is a plain literal in the script (it is config, not a runtime
+    // value), so it can be asserted directly.
+    check('the eyebrow still carries the product label',
+      (rings[0]?.script ?? '').includes("$brandName='DeepSeek Harness'"),
+      (rings[0]?.script ?? '').match(/\$brandName='[^']*'/)?.[0] ?? 'missing')
+    check('the product label is not printed twice',
+      decodeTitle(rings[0]?.script ?? '') !== 'DeepSeek Harness',
+      'headline would duplicate the eyebrow')
+  }
+
+  {
+    // A rename appends a second `session/title` event rather than rewriting the
+    // first, so the resolver has to take the LAST one — the name the user is
+    // looking at right now, not the name the conversation was born with.
+    const { harness, rings } = setup({
+      config: { minIntervalMs: 0 },
+      sessions: { s1: titled('新名字', titled('旧名字')) },
+    })
+    harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+    check('a renamed conversation shows its newest name',
+      decodeTitle(rings[0]?.script ?? '') === '新名字',
+      JSON.stringify(decodeTitle(rings[0]?.script ?? '')))
+  }
+
+  {
+    // A brand-new session has no title yet. Falling back to the configured
+    // label is the honest failure: a card headed "DeepSeek Harness" is still
+    // readable, whereas an empty headline row is a hole in the layout.
+    const { harness, rings } = setup({ config: { minIntervalMs: 0 }, sessions: {} })
+    harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+    check('a session with no name yet falls back to the configured title',
+      decodeTitle(rings[0]?.script ?? '') === 'DeepSeek Harness',
+      JSON.stringify(decodeTitle(rings[0]?.script ?? '')))
+  }
+
+  {
+    // No `sessions` service at all (a host that does not expose it, or a
+    // stripped profile). The resolver must stay silent and the card must still
+    // ring — a broken name lookup is not a reason to drop a notification.
+    const { harness, rings } = setup({ config: { minIntervalMs: 0 } })
+    harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+    check('a host without a session store still rings',
+      rings.length === 1, `rings=${rings.length}`)
+    check('...and falls back to the configured title',
+      decodeTitle(rings[0]?.script ?? '') === 'DeepSeek Harness',
+      JSON.stringify(decodeTitle(rings[0]?.script ?? '')))
+  }
+
+  {
+    // A title event whose data is not a usable string must not produce a card
+    // headed "undefined" or an empty row.
+    const { harness, rings } = setup({
+      config: { minIntervalMs: 0 },
+      sessions: { s1: [{ type: 'session/title', data: { title: '   ' } }] },
+    })
+    harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+    check('a blank title is treated as no title',
+      decodeTitle(rings[0]?.script ?? '') === 'DeepSeek Harness',
+      JSON.stringify(decodeTitle(rings[0]?.script ?? '')))
+  }
+
+  {
+    // `brand` is its own setting, so it can be changed without touching the
+    // headline. Sharing one field is what left the eyebrow slot blank.
+    const { harness, rings } = setup({
+      config: { minIntervalMs: 0, brand: '桌面版' },
+      sessions: { s1: titled('会话名') },
+    })
+    harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+    check('brand is a setting of its own',
+      (rings[0]?.script ?? '').includes("$brandName='桌面版'"),
+      (rings[0]?.script ?? '').match(/\$brandName='[^']*'/)?.[0] ?? 'missing')
+    check('changing brand leaves the headline alone',
+      decodeTitle(rings[0]?.script ?? '') === '会话名',
+      JSON.stringify(decodeTitle(rings[0]?.script ?? '')))
+  }
+
+  {
+    // The quick-popup tool stands in for a real card, so it has to be headed
+    // the same way — otherwise "does the card name the right conversation" is
+    // the one question the test seam cannot answer.
+    const { harness, rings } = setup({
+      tools: 'default',
+      sessions: { 'sess-a': titled('这个会话的名字') },
+    })
+    await harness.runTool('attention_popup', { preset: 'ok' }, { agent: { id: 'sess-a' } })
+    check('the quick-popup tool is headed by the conversation name',
+      decodeTitle(rings.at(-1)?.script ?? '') === '这个会话的名字',
+      JSON.stringify(decodeTitle(rings.at(-1)?.script ?? '')))
+    // An explicit title still wins: the tool has to stay usable for previewing
+    // arbitrary text.
+    await harness.runTool('attention_popup', { preset: 'ok', title: '自定义标题' }, { agent: { id: 'sess-a' } })
+    check('an explicit title still overrides the conversation name',
+      decodeTitle(rings.at(-1)?.script ?? '') === '自定义标题',
+      JSON.stringify(decodeTitle(rings.at(-1)?.script ?? '')))
+  }
+
+  {
+    // The popup request resolver is the one place a caller can see what the
+    // eyebrow will say without rendering anything.
+    const request = resolvePopup({ brand: 'DeepSeek Harness', title: 'fallback' }, {})
+    check('resolvePopup exposes the brand for the eyebrow', request.brand === 'DeepSeek Harness', JSON.stringify(request.brand))
+    check('...and keeps the title separate from it', request.title === 'fallback', JSON.stringify(request.title))
+    check('a caller can override the brand per card',
+      resolvePopup({ brand: 'DeepSeek Harness' }, { brand: '桌面版' }).brand === '桌面版', 'override')
+    // A profile written before the split only knows `title`; the eyebrow must
+    // still have something to print there instead of going blank.
+    check('an old profile with only `title` still fills the eyebrow',
+      resolvePopup({ title: 'DeepSeek Harness' }, {}).brand === 'DeepSeek Harness', 'legacy fallback')
   }
 }
 

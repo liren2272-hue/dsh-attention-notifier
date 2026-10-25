@@ -34,24 +34,35 @@ const scratchRoot = join(here, '..', '.screenshot-scratch')
 const ps = process.env.DSH_ATTENTION_POWERSHELL
   ?? 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
 
-/** The three tones, each with a body that shows off the card at its best. */
+/**
+ * The three tones, each with a body that shows off the card at its best.
+ *
+ * `title` here is what a real card receives: the CONVERSATION's name, resolved
+ * from the session's `session/title` event. The screenshots therefore show the
+ * headline the user actually sees — not the fixed product label, which now sits
+ * on the small `brand` line above it. Rendering the product label as the
+ * headline would document a layout the plugin no longer produces.
+ */
 export const CASES = [
   {
     file: 'card-ok.png',
     tone: 'ok',
-    title: 'DeepSeek Harness',
+    brand: 'DeepSeek Harness',
+    title: '重构 hotkey.js 的组合键解析',
     body: '已完成：重构了 `hotkey.js` 的组合键解析，**删掉**了重复的修饰键查表，`parseHotkey` 现在只走一条路径。测试 15/15 通过，用时 2 分 11 秒。',
   },
   {
     file: 'card-ask.png',
     tone: 'ask',
-    title: 'DeepSeek Harness',
+    brand: 'DeepSeek Harness',
+    title: '给 dsh-attention 仓库起名',
     body: '需要你选择：GitHub 上 `dsh-attention` 这个名字已被 6 个用户占用，仓库该叫什么？',
   },
   {
     file: 'card-alert.png',
     tone: 'alert',
-    title: 'DeepSeek Harness',
+    brand: 'DeepSeek Harness',
+    title: '插件安装失败，import 阶段被丢弃',
     body: '出错：`pnpm install` 在插件目录失败，`jose` 解析不到 — 插件在 import 阶段被静默丢弃。',
   },
 ]
@@ -89,7 +100,7 @@ export function generateScripts(cases, dir) {
   writeFileSync(capFile, `\ufeff${CAPTURE}`, 'utf8')
   const cards = cases.map((item) => {
     let script = buildScript(
-      { sound: false, popup: true, popupTimeoutMs: 20_000, balloon: false, box: false, powershell: ps },
+      { sound: false, popup: true, popupTimeoutMs: 20_000, balloon: false, box: false, powershell: ps, brand: item.brand },
       item.title,
       item.body,
       item.tone,

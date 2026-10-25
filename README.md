@@ -23,6 +23,15 @@ DeepSeek Harness 插件：agent 卡在等你决策时、以及任务结束时，
 
 正文里的 Markdown 会渲染：`` `代码` `` 变成带底色的等宽芯片，`**加粗**` 变成粗体。截断也是——超过三行的正文以省略号收尾，而不是把卡片撑高。
 
+### 卡片说的是哪个会话
+
+加粗标题是**这个会话的名字**——就是工作区列表里显示的那一行。四个窗口同时开着的时候，
+四张卡片都写着「DeepSeek Harness」等于什么都没说，所以标题让位给会话名，只占一行，太长就省略号。
+产品名没有丢，它退到标题上方那行小字（配置项 `brand`）。新会话还没生成名字时，
+标题退回 `title` 配置的兜底值。
+
+标题的可用宽度是**到状态胶囊左边为止**，所以无论会话名多长，文字都不会压到右边的「已完成」。
+
 一个没人回答的问题是永远不恢复的任务。所以提问类卡片会按 `remindEveryMs` 重复提醒，最多 `maxReminders` 次。
 
 ## 安装
@@ -97,7 +106,8 @@ git clone https://github.com/liren2272-hue/dsh-attention-notifier.git
 | `popupTimeoutMs` | `10000` | 卡片停留时长，0 = 等点击或 Esc。上限 600s |
 | `popupMs` | `9000` | 可见时长**下限**，防止手工改太小导致卡片一闪而过 |
 | `soundFile` | `C:\Windows\Media\notify.wav` | 提示音文件 |
-| `title` | `'DeepSeek Harness'` | 卡片标题 |
+| `title` | `'DeepSeek Harness'` | 标题**兜底值**。正常情况下加粗标题显示会话名称（取自会话的 `session/title` 事件），只有新会话还没生成名称时才用它 |
+| `brand` | `'DeepSeek Harness'` | 标题上方那行小字（产品标识）。与 `title` 拆开，因为标题现在让位给会话名了 |
 | `powershell` | `C:\Windows\System32\...\powershell.exe` | 绘制卡片用的 PowerShell |
 | `trace` | `true` | 诊断日志。信任它之后可以关掉 |
 | `traceFile` | `<临时目录>/dsh-attention/trace.log` | 诊断日志路径 |
@@ -144,7 +154,7 @@ cordis 的 waterfall 监听是**最外层优先**（`cbs.shift()`），一个不
 ## 测试
 
 ```bash
-npm test              # 182 个集成场景（走真实 apply() 与桩 context）
+npm test              # 295 个集成场景（走真实 apply() 与桩 context）
 npm run test:markdown # Markdown 子集单测
 ```
 
@@ -180,7 +190,7 @@ cordis.patch.yml    cordis 配置补丁
 icon.svg            插件图标
 locale/             插件在 DSH 设置界面显示的名称与描述（en / zh）
 docs/screenshots/   README 里的卡片效果图（由 test/render-screenshots.mjs 渲染）
-test/               run.mjs（182 场景）· markdown.mjs · harness.mjs · render-screenshots.mjs
+test/               run.mjs（295 场景）· markdown.mjs · harness.mjs · render-screenshots.mjs
 ```
 
 ## License

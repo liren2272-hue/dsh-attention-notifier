@@ -41,6 +41,18 @@
         # never reached the host, a `click` with no poll means the page never
         # asked, and `landed:false` means openSession ran and nothing changed.
         jump: true
+        # The bold headline is the CONVERSATION's name — the text the workspace
+        # list shows for it — because with several windows open "DeepSeek
+        # Harness" on every card identifies none of them. This key is the small
+        # muted product line ABOVE the headline, so the card still says which
+        # app it came from. It has to be its own setting: when the product label
+        # and the headline shared one field, moving the headline to the session
+        # name left the eyebrow slot with nothing to print and it rendered blank.
+        brand: 'DeepSeek Harness'
+        # Fallback headline, used only for a session that has no name yet (a
+        # brand-new one before its first `session/title` event). Everything else
+        # is headed by the session's own name.
+        title: 'DeepSeek Harness'
         # Diagnostics. Every listener entry and every ring is appended as a
         # JSON line, which is how "did it actually fire?" stays answerable.
         # Set trace: false once you trust it. Read the file as UTF-8.

@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
     // reach the browser", and a stale number here turns that answer into a lie
     // (the page reloads, the field still reads the old version, and the honest
     // conclusion — "the shell is serving a cached bundle" — never gets reached).
-    const VERSION = '1.6.1';
+    const VERSION = '1.7.0';
 
     /**
      * Resolve one host route against the page's own directory.
