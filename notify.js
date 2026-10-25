@@ -699,13 +699,45 @@ export function buildScript(cfg, title, body, tone = 'ok') {
     // 12px gap) makes the two columns line up and leaves the badge clear at any
     // title length.
     lines.push('  $tb2=New-Object System.Drawing.SolidBrush($script:cTitle)')
-    lines.push('  $tfmt=New-Object System.Drawing.StringFormat')
-    lines.push('  $tfmt.Trimming=[System.Drawing.StringTrimming]::EllipsisCharacter')
-    lines.push('  $tfmt.FormatFlags=[System.Drawing.StringFormatFlags]::LineLimit')
     lines.push('  $tw2=[int]($cx-$tx-[int](12*$k))')
     lines.push('  if($tw2 -lt [int](40*$k)){ $tw2=$lw }')
-    lines.push('  $gr.DrawString($title,$hf,$tb2,(New-Object System.Drawing.RectangleF($tx,$headY,$tw2,$headH)),$tfmt)')
-    lines.push('  $tfmt.Dispose()')
+    // THE HEADLINE IS TRIMMED BY HAND, NOT BY GDI+.
+    //
+    // This box used to carry `Trimming=EllipsisCharacter` + `LineLimit` and let
+    // GDI+ decide where to cut. It does cut — but only by its own bookkeeping,
+    // and that bookkeeping does not match what gets painted: MeasureString pads
+    // every single character with side bearings, so the laid-out width of a run
+    // is up to a third narrower than the sum of its parts. GDI+ compares the
+    // PADDED width against the box, decides the string is too long, and
+    // truncates — then paints the truncated run kerning it back down to the
+    // laid-out width, so the ellipsis lands early and the headline gives up a
+    // character it had room for. On the converse case — a run whose padded width
+    // happens to squeeze inside the box — it keeps every glyph and the ellipsis
+    // the user is looking for is simply not there.
+    //
+    // Both failure modes come from the same place: trusting a measurement that
+    // is not the one used to paint. The body already walks the string measuring
+    // the accumulated run (`$gr.MeasureString($cand,$fn).Width`, the width that
+    // DrawString will actually lay out) and appends the "…" itself. The headline
+    // now does exactly the same, for exactly the same reason, and the ellipsis
+    // stops depending on GDI+'s trimming heuristics: it appears if and only if
+    // a glyph was dropped, which is the only condition under which it should.
+    lines.push('  $hrun=$title; $hrunW=$gr.MeasureString($hrun,$hf).Width')
+    lines.push('  if($hrunW -gt $tw2){')
+    lines.push('    while($hrun.Length -gt 0){')
+    lines.push('      $hrun=$hrun.Substring(0,$hrun.Length-1)')
+    lines.push('      if($hrun.Length -eq 0){ break }')
+    lines.push('      $hrunW=$gr.MeasureString($hrun,$hf).Width')
+    // Reserve the ellipsis' own width while trimming, rather than appending it
+    // after. Appending last means the trimmed prefix plus "…" can still exceed
+    // the box — GDI+ would then clip the ellipsis itself, which is the bug in
+    // its purest form: a headline that says "more" by ending in nothing.
+    lines.push('      if(($gr.MeasureString($hrun+"…",$hf).Width) -le $tw2){ break }')
+    lines.push('    }')
+    lines.push('    if($hrun.Length -gt 0){ $gr.DrawString($hrun+"…",$hf,$tb2,$tx,$headY) }')
+    lines.push('  } else {')
+    lines.push('    $gr.DrawString($hrun,$hf,$tb2,$tx,$headY)')
+    lines.push('  }')
     // body, trimmed to the three-line box
     lines.push('  $fmt=New-Object System.Drawing.StringFormat')
     lines.push('  $fmt.Trimming=[System.Drawing.StringTrimming]::EllipsisCharacter')

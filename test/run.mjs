@@ -595,9 +595,19 @@ function decodeTitle(script) {
   check('the countdown hairline spans the content, so it ends at the text margin',
     script.includes('RR $padX $ty ($w-$padX-$padR)'))
   // A long headline must ellipsise rather than run into the edge.
+  //
+  // The headline is trimmed by hand — measuring the accumulated run, exactly as
+  // the body walk does — instead of delegating to GDI+'s EllipsisCharacter.
+  // GDI+ compares the PADDED per-character width against the box, so it cuts a
+  // run that already fits (giving up a character it had room for) and, on the
+  // flip side, leaves a run that genuinely overflows with no ellipsis at all.
+  // Both are "the bold title is too long and shows no …", which is what this
+  // reports.
   check('a long headline is trimmed to the text column',
-    script.includes('$gr.DrawString($title,$hf,$tb2,(New-Object System.Drawing.RectangleF($tx,$headY,$tw2,$headH)),$tfmt)') &&
-      !script.includes('$gr.DrawString($title,$hf,$tb2,$tx,$headY)'))
+    script.includes('$gr.DrawString($hrun+"…",$hf,$tb2,$tx,$headY)') &&
+      // the ellipsis' own width must be reserved while trimming, not appended after
+      script.includes('if(($gr.MeasureString($hrun+"…",$hf).Width) -le $tw2){ break }') &&
+      !script.includes('$gr.DrawString($title,$hf,$tb2,(New-Object System.Drawing.RectangleF($tx,$headY,$tw2,$headH)),$tfmt)'))
   // The headline's box must END AT THE CHIP, not at the card's right margin.
   //
   // The bug this locks out: the headline was laid out to the full text column
