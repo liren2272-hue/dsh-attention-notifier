@@ -1,6 +1,7 @@
 {
   "name": "@liren2272/dsh-attention",
   "version": "1.7.1",
+  "icon": "./icon.svg",
   "private": true,
   "type": "module",
   "license": "MIT",
