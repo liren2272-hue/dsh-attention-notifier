@@ -1,6 +1,6 @@
 {
   "name": "@liren2272/dsh-attention",
-  "version": "1.7.1",
+  "version": "1.7.2",
   "icon": "./icon.svg",
   "private": true,
   "type": "module",
@@ -62,6 +62,6 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2"
+    "@deepseek-ai/cordis": "^4.0.5"
   }
 }
