@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
     // reach the browser", and a stale number here turns that answer into a lie
     // (the page reloads, the field still reads the old version, and the honest
     // conclusion — "the shell is serving a cached bundle" — never gets reached).
-    const VERSION = '1.7.0';
+    const VERSION = '1.8.0';
 
     /**
      * Resolve one host route against the page's own directory.
@@ -510,9 +510,36 @@ window.__ModuleLoader__.load({
         };
         timer = setTimeout(start, 1000);
 
+        // That tick is the fallback, not the delivery mechanism. A hidden
+        // renderer has its timers throttled (Chromium parks background pages at
+        // roughly one wake per minute), and the window a card raises from the
+        // tray was hidden until the click: the page can sit frozen for longer
+        // than the claim is readable, then find it gone — the window comes
+        // back, the conversation does not. `visibilitychange` is the one signal
+        // that arrives exactly when the window is on screen again, so poll on
+        // it, immediately. The timer stays for a shell without the event.
+        let onVisibility = null;
+        try {
+          if (typeof document.addEventListener === 'function') {
+            onVisibility = () => {
+              if (document.visibilityState === 'visible') poll();
+            };
+            document.addEventListener('visibilitychange', onVisibility);
+          }
+        } catch {
+          /* no DOM events: the timer alone carries the polling */
+        }
+
         return () => {
           stopped = true;
           clearTimeout(timer);
+          if (onVisibility !== null && typeof document.removeEventListener === 'function') {
+            try {
+              document.removeEventListener('visibilitychange', onVisibility);
+            } catch {
+              /* best effort */
+            }
+          }
         };
       },
     };

@@ -14,7 +14,7 @@
  * (HRESULT 0x80073D54), so delivery is a short-lived detached PowerShell
  * process that plays a system sound and shows a tray balloon tip.
  */
-import { ring } from './notify.js'
+import { ring, DEFAULT_RAISE_LOG } from './notify.js'
 import { POPUP_PRESETS, POPUP_TONES, popup } from './popup.js'
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -52,8 +52,18 @@ function jumpTtlFor(timeoutMs) {
  * Long enough for several open pages to poll it at least once (the polling
  * cadence is one second) and short enough that a user who navigated away is not
  * dragged back. Each page applies a given jump id exactly once.
+ *
+ * The bound is set by the slowest honest reader, not the fastest one: a card
+ * clicked while the harness sits in the tray queues its claim against a
+ * renderer whose timers Chromium has throttled to background speed. The page
+ * wakes on the raise, but it does not necessarily run a poll inside the first
+ * second — the recorded click-to-handout gaps on this machine top out past
+ * twelve seconds, and every claim older than this constant answered "nothing
+ * pending". A page that came back late used to find the jump gone: the window
+ * returned, the conversation did not. Sixty seconds covers the wake and the
+ * unfreeze while staying short enough to be tied to the click that asked.
  */
-const CLAIM_TTL_MS = 15_000
+const CLAIM_TTL_MS = 60_000
 
 /**
  * Channel choice is empirical, not aesthetic. On this machine the tray balloon
@@ -101,9 +111,18 @@ const DEFAULTS = {
   brand: 'DeepSeek Harness',
   powershell: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
   // Process name whose window is raised when the card is clicked. Matched
-  // against `Get-Process -Name`, so it is the friendly process name, not the
-  // window title (both happen to be "DeepSeek Harness" here).
+  // against the friendly process name (`DeepSeek Harness`, not the exe file and
+  // not a window title). The raiser enumerates that process's top-level windows
+  // itself rather than trusting MainWindowHandle, which is 0 for a window the
+  // app hid when its close button was sent to the tray; a window that is hidden
+  // is woken through the app's own single-instance path, so the renderer really
+  // comes back rather than showing a frozen last frame.
   focusProcess: 'DeepSeek Harness',
+  // Where the raiser logs which window it picked and how it woke it. Raising
+  // fails silently — the card closes either way — so this file is the only way
+  // to tell "nothing found" from "already where you left it". Empty string
+  // disables it.
+  raiseLog: DEFAULT_RAISE_LOG,
   // Also name the session: the click POSTs a one-shot token to the host's
   // jump route and the page's client half opens exactly the session that
   // interrupted you. False keeps raise-the-window-only behaviour.

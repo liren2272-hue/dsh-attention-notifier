@@ -100,7 +100,8 @@ git clone https://github.com/liren2272-hue/dsh-attention-notifier.git
 | `minIntervalMs` | `4000` | 同类通知的合并窗口（连问三次只响一次） |
 | `remindEveryMs` | `120000` | 无人回应时的重复提醒间隔 |
 | `maxReminders` | `3` | 最多重复提醒几次，然后停止 |
-| `focusProcess` | `'DeepSeek Harness'` | 点击卡片时唤起哪个进程（按**进程名**匹配，不是窗口标题） |
+| `focusProcess` | `'DeepSeek Harness'` | 点击卡片时唤起哪个进程（按**进程名**匹配，不是窗口标题）。窗口自己隐藏时（关到托盘）`MainWindowHandle` 是 0，旧实现在这里直接什么也不做；现在按进程枚举它的所有顶层窗口来挑，隐藏的用程序自身的「二次启动」路径唤醒，唤醒回来的是可交互的页面，不是定格的最后一帧 |
+| `raiseLog` | `%TEMP%\dsh-attention\raise.log` | 唤起窗口时写了什么：挑中哪个窗口、有没有唤醒、有没有拿到前台。唤起失败没有任何现象（卡片照样关闭），这个文件是区分「没找到可唤起的窗口」和「窗口本来就在」的唯一依据；写成 `''` 关闭 |
 | `jump` | `true` | 点击卡片时把页面切到打断你的那个会话 |
 | `stack` | `true` | 多张卡片同时存在时堆叠（后到的向右上错位） |
 | `popupTimeoutMs` | `10000` | 卡片停留时长，0 = 等点击或 Esc。上限 600s |
@@ -154,7 +155,7 @@ cordis 的 waterfall 监听是**最外层优先**（`cbs.shift()`），一个不
 ## 测试
 
 ```bash
-npm test              # 295 个集成场景（走真实 apply() 与桩 context）
+npm test              # 309 个集成场景（走真实 apply() 与桩 context）
 npm run test:markdown # Markdown 子集单测
 ```
 
@@ -190,7 +191,7 @@ cordis.patch.yml    cordis 配置补丁
 icon.svg            插件图标
 locale/             插件在 DSH 设置界面显示的名称与描述（en / zh）
 docs/screenshots/   README 里的卡片效果图（由 test/render-screenshots.mjs 渲染）
-test/               run.mjs（295 场景）· markdown.mjs · harness.mjs · render-screenshots.mjs
+test/               run.mjs（309 场景）· markdown.mjs · harness.mjs · render-screenshots.mjs
 ```
 
 ## License

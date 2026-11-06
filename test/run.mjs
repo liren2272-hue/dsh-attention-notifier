@@ -2,7 +2,7 @@ import { readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../index.js'
-import { buildScript } from '../notify.js'
+import { buildScript, DEFAULT_RAISE_LOG, RAISE_CSHARP_SOURCE, raiseCacheFile, ensureRaiserCache } from '../notify.js'
 import { POPUP_PRESETS, popup, resolvePopup } from '../popup.js'
 import { createHarness } from './harness.mjs'
 
@@ -15,11 +15,15 @@ function check(name, condition, detail = '') {
   console.log(`${condition ? 'ok  ' : 'FAIL'}  ${name}${detail === '' ? '' : ` — ${detail}`}`)
 }
 
-/** The script carries title then body, both base64; the last one is the body. */
+/**
+ * The script carries, in order: title, body, the markdown payload, and then the
+ * raiser's process name and log path — all base64. Pinned by index, not by
+ * "last", because adding a setting to the raiser would otherwise silently move
+ * what every body assertion decodes.
+ */
 function decodeBody(script) {
   const matches = [...script.matchAll(/FromBase64String\('([^']+)'\)/g)]
-  const last = matches.at(-1)?.[1] ?? ''
-  return Buffer.from(last, 'base64').toString('utf8')
+  return Buffer.from(matches[1]?.[1] ?? '', 'base64').toString('utf8')
 }
 
 /**
@@ -970,37 +974,151 @@ function decodeTitle(script) {
 // and the card becomes foreground the instant it is clicked. A host-side
 // SetForegroundWindow would be a background call and would only flash the
 // taskbar.
+//
+// The raiser is ~13 KB of C#. It used to be inlined into every card, making
+// each generated .ps1 ~28 KB and recompiling the same type on every click.
+// It now lives in one hash-named .cs file under the temp directory and the
+// card compiles it with Add-Type -LiteralPath. The C#-level assertions below
+// therefore read RAISE_CSHARP_SOURCE (the cached file's exact bytes) while the
+// card-level ones assert the card no longer carries that source at all.
 
 {
   const script = buildScript({ popup: true, popupMs: 1000, sound: false, balloon: false, box: false }, 't', 'b')
 
+  // The raiser is a compiled C# type and the click calls it. The old
+  // implementation was a `Get-Process` loop over MainWindowHandle — which is
+  // 0 for a window the app hid itself (close to the tray), so the click found
+  // nothing, did nothing, and the card just looked dead. Reverting to it must
+  // fail here.
   check(
-    'the card resolves the harness window by process name',
-    /function FocusDsh\(\)/.test(script) && /Get-Process -Name 'DeepSeek Harness'/.test(script),
+    'the card raises the window through the compiled raiser',
+    /function FocusDsh\(\)\{ \$null=\[AttentionRaise\]::Run\(/.test(script),
+  )
+  // This is the slimming regression: on the pre-slim copy the card inlined the
+  // whole C# here-string, so LiteralPath was absent, the source WAS present,
+  // and the script was ~28 KB. All three conditions must hold now.
+  check(
+    'the card compiles a cached .cs file instead of carrying the C# source',
+    script.includes('Add-Type -LiteralPath $raiseCs')
+      && !script.includes("Add-Type -TypeDefinition @'")
+      && !script.includes('public class AttentionRaise')
+      && !script.includes('static bool WakeViaSecondInstance')
+      && Buffer.byteLength(script, 'utf8') < 18_000,
+    `card=${Buffer.byteLength(script, 'utf8')}B csharp=${Buffer.byteLength(RAISE_CSHARP_SOURCE, 'utf8')}B`,
   )
   check(
-    'a minimised harness is restored before focus is handed over',
-    /IsIconic\(\$p\.MainWindowHandle\)\)\{ \[void\]\[AttentionDpi\]::ShowWindow\(\$p\.MainWindowHandle,9\)/.test(script),
+    'the raiser picks the window by enumerating every top-level window of the named process',
+    RAISE_CSHARP_SOURCE.includes('static int Score(IntPtr hWnd)')
+      && RAISE_CSHARP_SOURCE.includes('EnumWindows(delegate(IntPtr hWnd, IntPtr lParam)')
+      && RAISE_CSHARP_SOURCE.includes('pids.Contains(pid)'),
   )
-  check('focus is handed to the harness window', /SetForegroundWindow\(\$p\.MainWindowHandle\)/.test(script))
+  check(
+    'a window the app hid itself is woken through the single-instance path, not ShowWindow',
+    RAISE_CSHARP_SOURCE.includes('static bool WakeViaSecondInstance(IntPtr hWnd)')
+      && RAISE_CSHARP_SOURCE.includes('info.EnvironmentVariables.Remove("ELECTRON_RUN_AS_NODE")')
+      && /if \(hidden\)\s*\{\s*woken = WakeViaSecondInstance\(target\)/.test(RAISE_CSHARP_SOURCE),
+  )
+  check(
+    'a minimised window is restored through WM_SYSCOMMAND with a ShowWindowAsync fallback',
+    RAISE_CSHARP_SOURCE.includes('const int SC_RESTORE = 0xF120;')
+      && RAISE_CSHARP_SOURCE.includes('SysCommand(target, SC_RESTORE)')
+      && RAISE_CSHARP_SOURCE.includes('ShowWindowAsync(target, SW_RESTORE)'),
+  )
+  check(
+    'focus is handed over with the thread-input attach that makes it stick',
+    RAISE_CSHARP_SOURCE.includes('AttachThreadInput(self, foregroundThread, true)')
+      && RAISE_CSHARP_SOURCE.includes('BringWindowToTop(hWnd)')
+      && RAISE_CSHARP_SOURCE.includes('SetForegroundWindow(hWnd)'),
+  )
+  check('the raiser never depends on MainWindowHandle', !RAISE_CSHARP_SOURCE.includes('MainWindowHandle'))
+  check(
+    'an untitled helper window and a tool window cannot be mistaken for the app',
+    RAISE_CSHARP_SOURCE.includes('if (title.Length == 0 && !frame) return int.MinValue;')
+      && RAISE_CSHARP_SOURCE.includes('if ((GetWindowLong(hWnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0) return int.MinValue;'),
+  )
   check(
     'the click both focuses and closes',
     (script.match(/FocusDsh; \$f\.Close\(\)/g) ?? []).length === 1,
     String((script.match(/FocusDsh; \$f\.Close\(\)/g) ?? []).length),
   )
+  // The process name travels as UTF-8 base64, so it needs no quoting at all —
+  // which is what makes a name containing a single quote (or any non-ASCII name)
+  // harmless instead of script-breaking.
   check(
     'the focus target is configurable',
-    /Get-Process -Name 'Other App'/.test(
-      buildScript({ popup: true, sound: false, balloon: false, box: false, focusProcess: 'Other App' }, 't', 'b'),
-    ),
+    script.includes("[AttentionRaise]::Run([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('RGVlcFNlZWsgSGFybmVzcw=='))")
+      && buildScript({ popup: true, sound: false, balloon: false, box: false, focusProcess: 'Other App' }, 't', 'b')
+        .includes("[Convert]::FromBase64String('T3RoZXIgQXBw')"),
   )
-  // A quote in the name would otherwise break out of the PowerShell literal.
   check(
-    'the focus target escapes single quotes',
-    /Get-Process -Name 'a''b'/.test(
-      buildScript({ popup: true, sound: false, balloon: false, box: false, focusProcess: "a'b" }, 't', 'b'),
-    ),
+    'the focus target survives a single quote in its name',
+    buildScript({ popup: true, sound: false, balloon: false, box: false, focusProcess: "a'b" }, 't', 'b')
+      .includes("[Convert]::FromBase64String('YSdi')"),
   )
+  check(
+    'the raiser logs which window it chose',
+    script.includes(`[Convert]::FromBase64String('${Buffer.from(DEFAULT_RAISE_LOG, 'utf8').toString('base64')}')`),
+  )
+  check(
+    'the raiser log can be turned off without breaking the call',
+    buildScript({ popup: true, sound: false, balloon: false, box: false, raiseLog: '' }, 't', 'b')
+      .includes("[Convert]::FromBase64String('')"),
+  )
+  check(
+    'the cached .cs filename is keyed to the raiser source and reaches the card',
+    /attention-raise-[0-9a-f]{12}\.cs$/.test(raiseCacheFile())
+      && script.includes(`[Convert]::FromBase64String('${Buffer.from(raiseCacheFile(), 'utf8').toString('base64')}')`),
+  )
+}
+
+// ---- 17b. ring() writes the cached .cs before the card runs ----------------
+//
+// Section 17 proves the card points at a cache file; this proves the delivery
+// path actually creates it. Without it, Add-Type -LiteralPath would fail on a
+// fresh machine and no card could raise the window at all.
+
+{
+  const { rings, spawn } = makeRings()
+  const cfg = {
+    popup: true, sound: false, balloon: false, box: false,
+    powershell: 'pwsh', logFile: '', trace: false, spawn,
+  }
+  const harness = createHarness()
+  apply(harness.ctx, cfg)
+  harness.waterfall('user-questions/request', {
+    questions: [{ id: 'q', question: 'still waiting?' }],
+    agent: { id: 'root' },
+  })
+  const cacheCs = raiseCacheFile()
+  const cached = (() => { try { return readFileSync(cacheCs, 'utf8') } catch { return '' } })()
+  check('ring() writes the raiser source to the hashed cache file', cached === RAISE_CSHARP_SOURCE,
+    `${cacheCs} -> ${cached.length}B`)
+  const script = rings[0]?.script ?? ''
+  check('the fired card points at that exact cache file',
+    script.includes(`[Convert]::FromBase64String('${Buffer.from(cacheCs, 'utf8').toString('base64')}')`)
+      && script.includes('Add-Type -LiteralPath $raiseCs'))
+  rmSync(cacheCs, { force: true })
+}
+
+// ---- 17c. a standalone card is self-contained -----------------------------
+//
+// test/render-screenshots.mjs (and the live probes) call buildScript directly
+// and spawn the resulting .ps1 themselves, without going through ring(). If
+// only ring() created the cached .cs, those cards would fail Add-Type on a
+// fresh machine - a real functionality regression from the slimming.
+{
+  const cacheCs = raiseCacheFile()
+  rmSync(cacheCs, { force: true })
+  const script = buildScript({ popup: true, popupMs: 1000, sound: false, balloon: false, box: false }, 't', 'b')
+  const cached = (() => { try { return readFileSync(cacheCs, 'utf8') } catch { return '' } })()
+  check('buildScript alone writes the cache its own card points at',
+    cached === RAISE_CSHARP_SOURCE
+      && script.includes(`[Convert]::FromBase64String('${Buffer.from(cacheCs, 'utf8').toString('base64')}')`)
+      && script.includes('Add-Type -LiteralPath $raiseCs'),
+    `${cacheCs} -> ${cached.length}B`)
+  check('ensureRaiserCache is idempotent for the same source',
+    ensureRaiserCache() === cacheCs && readFileSync(cacheCs, 'utf8') === RAISE_CSHARP_SOURCE)
+  rmSync(cacheCs, { force: true })
 }
 
 // ---- 18. the click names the session, not just the window ------------------
@@ -1083,6 +1201,26 @@ function decodeTitle(script) {
     check('a replayed token queues nothing',
       after.status === 200 && JSON.parse(after.body).jumpId === JSON.parse(got.body).jumpId,
       after.body)
+
+    // The tray case. A card clicked while the window was hidden queues its
+    // claim against a renderer whose timers Chromium throttles in the
+    // background: the raise wakes the page, but the first poll can be many
+    // seconds late, and the recorded click-to-handout gaps on this machine run
+    // past twelve. A claim that aged out in the meantime answers "nothing
+    // pending" — the window comes back, the conversation does not. So a claim
+    // must still be readable half a minute after the click. (The clock is put
+    // back: every later section reads relative timing off it.)
+    clock += 30_000
+    const late = await harness.serve('GET', '/dsh-attention/pending')
+    check('a claim is still readable thirty seconds after the click',
+      late.status === 200 && JSON.parse(late.body).jumpId === JSON.parse(got.body).jumpId,
+      `${late.status} ${late.body ?? ''}`)
+    // And it must not live forever: past the bound, the user who navigated
+    // away is no longer dragged back.
+    clock += 60_000
+    const stale = await harness.serve('GET', '/dsh-attention/pending')
+    check('a claim older than the readability window expires', stale.status === 204, String(stale.status))
+    clock -= 90_000
   }
 
   // No carrier: the notifier still fires, just without a jump url.

@@ -28,8 +28,17 @@
         remindEveryMs: 120000
         maxReminders: 3
         # Clicking a card raises this process's window, so "go deal with it" is
-        # one click. Matched as a process name, not a window title.
+        # one click. Matched as a process name, not a window title. The raiser
+        # enumerates that process's windows itself: a window the app hid when
+        # closed to the tray has no MainWindowHandle at all, and the old loop
+        # then silently did nothing. Hidden windows are woken through the app's
+        # own single-instance path, so the page is interactive, not a frozen
+        # last frame.
         focusProcess: 'DeepSeek Harness'
+        # Where the raiser writes which window it chose and how it woke it.
+        # Raising fails silently, so this is the only evidence separating
+        # "found nothing to raise" from "the window was already up". '' off.
+        raiseLog: 'C:\\Users\\15940\\AppData\\Local\\Temp\\dsh-attention\\raise.log'
         # And name the session: the click hands a one-shot token to the host
         # and the page opens the exact session that interrupted you. Set false
         # for raise-the-window-only.

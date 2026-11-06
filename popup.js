@@ -14,7 +14,7 @@
  *   - the `attention_popup` tool registered in index.js, so the model can fire
  *     one mid-conversation while working on the plugin;
  *   - `import { popup } from './popup.js'` from a plain script, which needs no
- *     host at all — that is what test/popup-live.mjs does.
+ *     host at all — that is what any standalone script does.
  */
 import { ACCENTS, ring } from './notify.js'
 
@@ -100,7 +100,7 @@ export function resolvePopup(cfg = {}, options = {}) {
  *
  * `mint` is injected rather than imported because the token table lives in
  * index.js beside the route that consumes it — and because a plain script
- * (test/popup-live.mjs) has no host at all and therefore nothing to mint
+ * (a standalone script calling popup) has no host at all and therefore nothing to mint
  * against. Returns undefined when there is nothing to mint with, which the
  * caller reports as "this card cannot jump" instead of silently dropping it.
  *

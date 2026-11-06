@@ -16,12 +16,23 @@
  * after the fact instead of guessed from memory.
  */
 import { spawn } from 'node:child_process'
-import { appendFileSync, mkdirSync, statSync, truncateSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, truncateSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { renderMarkdown } from './markdown.js'
 
 export const DEFAULT_LOG = join(tmpdir(), 'dsh-attention', 'notify.log')
+/**
+ * Where the window raiser writes what it actually found.
+ *
+ * Raising a window is the one part of delivery whose failure is invisible: the
+ * card closes either way, and "nothing happened" looks exactly like "the window
+ * was already where you left it". The raiser therefore logs the window it chose
+ * and every decision it took to get there, in its own file so this stays readable
+ * next to the ring log.
+ */
+export const DEFAULT_RAISE_LOG = join(tmpdir(), 'dsh-attention', 'raise.log')
 const LOG_MAX_BYTES = 256 * 1024
 
 /**
@@ -84,6 +95,443 @@ $badgePath.AddPolygon([System.Drawing.PointF[]]@((New-Object System.Drawing.Poin
 
 function b64(text) {
   return Buffer.from(String(text ?? ''), 'utf8').toString('base64')
+}
+
+/**
+ * The window raiser, as one compiled C# type.
+ *
+ * Why this exists at all: the click handler used to walk `Get-Process` and use
+ * `$p.MainWindowHandle`. Measured on this machine with the harness window
+ * closed to the tray, that handle is **0** for every harness process but one,
+ * and the one that has a handle has it because it is already visible. So the
+ * old code found nothing to raise, clicked silently, and left the card closing
+ * onto a screen with no harness in it. MainWindowHandle is only ever the window
+ * the process published to the shell, and a window the app hid itself publishes
+ * nothing. This enumerates top-level windows and scores them instead.
+ *
+ * Three things the implementation has to get right, each learned from a
+ * sibling plugin (dsh-window-hotkey) that solves the same problem from a
+ * global hotkey:
+ *
+ *   1. Selection is by *process*, never by title alone, and a candidate must
+ *      have a title, must not be a tool window, and must belong to a process
+ *      with the configured name. Visibility, window class, executable and size
+ *      are evidence that ranks candidates, not filters that can match nothing.
+ *   2. `window.hide()` in Electron is not a Win32 hide. The renderer keeps its
+ *      last frame, so ShowWindow resurrects a window that paints correctly and
+ *      then ignores every click and keystroke. The only external trigger a
+ *      running harness treats as "show the primary window" is a second launch:
+ *      its single-instance handler calls focusPrimaryWindow, which is
+ *      Electron's own window.show(). That is what wakes the renderer.
+ *   3. The child launched for that second instance MUST NOT inherit
+ *      ELECTRON_RUN_AS_NODE. This card runs as a child of a node-mode Electron
+ *      host, so the variable is in the environment; inherited, the "second
+ *      instance" starts as a script runner and can neither claim the lock nor
+ *      forward the event. It is removed from the child's environment.
+ *
+ * Nothing here starts the harness when it is not running: a card from a session
+ * that already ended should not conjure a new app instance. It logs and leaves.
+ *
+ * The code is pure ASCII and must stay that way — it is cached as a .cs file
+ * and compiled by Windows PowerShell 5.1's Add-Type -LiteralPath. Names, paths
+ * and the configured process name travel as base64 arguments instead.
+ */
+export const RAISE_CSHARP = `
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+using System.Runtime.InteropServices;
+
+public class AttentionRaise
+{
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr hWnd, StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr hWnd, StringBuilder s, int n);
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hWnd, int index);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint attach, uint attachTo, bool fAttach);
+    [DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr hWnd, int cmd);
+    [DllImport("user32.dll")] static extern bool SendMessageTimeoutW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageNameW(IntPtr handle, uint flags, StringBuilder s, ref uint size);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT
+    {
+        public int left;
+        public int top;
+        public int right;
+        public int bottom;
+    }
+
+    const int GWL_EXSTYLE = -20;
+    const int WS_EX_TOOLWINDOW = 0x80;
+    const int SW_SHOW = 5;
+    const int SW_RESTORE = 9;
+    const uint WM_SYSCOMMAND = 0x0112;
+    const int SC_RESTORE = 0xF120;
+    const uint SMTO_ABORTIFHUNG = 0x0002;
+    const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
+    static string logPath = "";
+    static string suffix = "";
+    static HashSet<uint> pids = new HashSet<uint>();
+    static uint selfPid = 0;
+
+    static void Log(string message)
+    {
+        try
+        {
+            string dir = Path.GetDirectoryName(logPath);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            FileInfo info = new FileInfo(logPath);
+            if (info.Exists && info.Length > 256 * 1024) File.WriteAllText(logPath, "");
+            File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss.fff") + " [raise] " + message + Environment.NewLine);
+        }
+        catch
+        {
+            // logging must never break the click
+        }
+    }
+
+    static string TitleOf(IntPtr hWnd)
+    {
+        StringBuilder buffer = new StringBuilder(512);
+        int n = GetWindowTextW(hWnd, buffer, buffer.Capacity);
+        if (n <= 0) return "";
+        return buffer.ToString(0, Math.Min(n, buffer.Length));
+    }
+
+    static string ClassOf(IntPtr hWnd)
+    {
+        StringBuilder buffer = new StringBuilder(128);
+        int n = GetClassNameW(hWnd, buffer, buffer.Capacity);
+        if (n <= 0) return "";
+        return buffer.ToString(0, Math.Min(n, buffer.Length));
+    }
+
+    static string ImageName(uint pid)
+    {
+        IntPtr handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (handle == IntPtr.Zero) return "";
+        try
+        {
+            StringBuilder buffer = new StringBuilder(1024);
+            uint size = (uint)buffer.Capacity;
+            if (!QueryFullProcessImageNameW(handle, 0, buffer, ref size)) return "";
+            return buffer.ToString();
+        }
+        catch
+        {
+            return "";
+        }
+        finally
+        {
+            CloseHandle(handle);
+        }
+    }
+
+    /// <summary>
+    /// How much this window looks like the harness window worth raising.
+    /// int.MinValue means it is not a candidate at all: no title, a tool
+    /// window, or a window that does not belong to the configured process.
+    /// Everything after that is ranking, so a renamed or re-skinned build
+    /// still produces exactly one candidate rather than none.
+    /// </summary>
+    static int Score(IntPtr hWnd)
+    {
+        string cls = ClassOf(hWnd);
+        bool frame = cls.StartsWith("Chrome_WidgetWin_1", StringComparison.Ordinal);
+        string title = TitleOf(hWnd);
+        // A candidate has to announce itself somehow. The Electron main frame is
+        // Chrome_WidgetWin_1, so it counts even when its title is momentarily
+        // empty; everything else needs a title, which is what keeps the IME and
+        // the tray's NotifyIconHostWindow from being mistaken for the app.
+        if (title.Length == 0 && !frame) return int.MinValue;
+        if ((GetWindowLong(hWnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0) return int.MinValue;
+        uint pid;
+        GetWindowThreadProcessId(hWnd, out pid);
+        if (!pids.Contains(pid)) return int.MinValue;
+
+        int score = 0;
+        if (IsWindowVisible(hWnd)) score += 20; else score += 2;
+        if (IsIconic(hWnd)) score += 5;
+        if (frame) score += 15;
+        else if (cls.StartsWith("Chrome_WidgetWin", StringComparison.Ordinal)) score += 8;
+        if (title.Length == 0) score -= 25;
+        if (suffix.Length > 0 && title.EndsWith(suffix, StringComparison.Ordinal)) score += 40;
+        string image = ImageName(pid);
+        if (image.Length > 0 && image.EndsWith(suffix + ".exe", StringComparison.OrdinalIgnoreCase)) score += 60;
+        RECT rect;
+        if (GetWindowRect(hWnd, out rect))
+        {
+            int area = (rect.right - rect.left) * (rect.bottom - rect.top) / 20000;
+            if (area < 0) area = 0;
+            if (area > 30) area = 30;
+            score += area;
+        }
+        if (pid == selfPid) score -= 5;
+        return score;
+    }
+
+    static IntPtr Scan(bool visibleOnly)
+    {
+        IntPtr best = IntPtr.Zero;
+        int bestScore = int.MinValue;
+        EnumWindows(delegate(IntPtr hWnd, IntPtr lParam)
+        {
+            if (visibleOnly && !IsWindowVisible(hWnd)) return true;
+            int score = Score(hWnd);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best = hWnd;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return best;
+    }
+
+    /// <summary>Used only to report honestly which window ended up on top.</summary>
+    static bool AlreadyFocused(IntPtr hWnd)
+    {
+        try
+        {
+            return GetForegroundWindow() == hWnd;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Fallback path when the app window rejects ShowWindow (UIPI).</summary>
+    static bool SysCommand(IntPtr hWnd, int command)
+    {
+        try
+        {
+            IntPtr result;
+            return SendMessageTimeoutW(hWnd, WM_SYSCOMMAND, (IntPtr)command, IntPtr.Zero, SMTO_ABORTIFHUNG, 2000, out result);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Hand the foreground over. The card is the foreground window at this
+    /// moment, because it was just clicked, which is what makes an inter-process
+    /// SetForegroundWindow legal at all; the thread-input attach is what makes it
+    /// stick when the harness is still finishing its own show.
+    /// </summary>
+    static bool Focus(IntPtr hWnd)
+    {
+        IntPtr foreground = GetForegroundWindow();
+        uint pid;
+        uint foregroundThread = foreground == IntPtr.Zero ? 0 : GetWindowThreadProcessId(foreground, out pid);
+        uint self = GetCurrentThreadId();
+        bool attached = false;
+        try
+        {
+            if (foregroundThread != 0 && foregroundThread != self) attached = AttachThreadInput(self, foregroundThread, true);
+        }
+        catch
+        {
+        }
+        try
+        {
+            BringWindowToTop(hWnd);
+            bool ok = SetForegroundWindow(hWnd);
+            if (!ok)
+            {
+                Thread.Sleep(20);
+                ok = SetForegroundWindow(hWnd);
+            }
+            return ok;
+        }
+        finally
+        {
+            if (attached)
+            {
+                try { AttachThreadInput(self, foregroundThread, false); } catch { }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Ask the running harness to show its own window by launching it again.
+    /// Bounded: the newcomer exits as soon as it has handed the event over, so
+    /// polling stops at the first visible candidate and never waits longer than
+    /// about three seconds in the worst case.
+    /// </summary>
+    static bool WakeViaSecondInstance(IntPtr hWnd)
+    {
+        uint pid;
+        GetWindowThreadProcessId(hWnd, out pid);
+        string exe = ImageName(pid);
+        if (exe.Length == 0)
+        {
+            Log("wake skipped: cannot resolve the executable of pid " + pid);
+            return false;
+        }
+        try
+        {
+            ProcessStartInfo info = new ProcessStartInfo();
+            info.FileName = exe;
+            info.UseShellExecute = false;
+            info.CreateNoWindow = true;
+            try { info.EnvironmentVariables.Remove("ELECTRON_RUN_AS_NODE"); } catch { }
+            try { info.EnvironmentVariables.Remove("ELECTRON_NO_ATTACH_CONSOLE"); } catch { }
+            Process child = Process.Start(info);
+            if (child != null) child.Dispose();
+            for (int i = 0; i < 30; i++)
+            {
+                Thread.Sleep(100);
+                if (IsWindowVisible(hWnd))
+                {
+                    Thread.Sleep(400);
+                    return true;
+                }
+                if (Scan(true) != IntPtr.Zero)
+                {
+                    Thread.Sleep(400);
+                    return true;
+                }
+            }
+            return false;
+        }
+        catch (Exception error)
+        {
+            Log("wake failed: " + error.GetType().Name + ": " + error.Message);
+            return false;
+        }
+    }
+
+    static string Describe(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero) return "none";
+        uint pid;
+        GetWindowThreadProcessId(hWnd, out pid);
+        string title = TitleOf(hWnd);
+        if (title.Length > 60) title = title.Substring(0, 60) + "...";
+        return "hwnd=0x" + hWnd.ToInt64().ToString("X8") + " pid=" + pid + " class=" + ClassOf(hWnd)
+            + " visible=" + IsWindowVisible(hWnd) + " iconic=" + IsIconic(hWnd) + " title=" + title;
+    }
+
+    public static int Run(string processName, string logFile)
+    {
+        logPath = logFile == null ? "" : logFile;
+        suffix = processName == null ? "" : processName.Trim();
+        selfPid = (uint)Process.GetCurrentProcess().Id;
+        pids = new HashSet<uint>();
+
+        try
+        {
+            foreach (Process process in Process.GetProcesses())
+            {
+                try
+                {
+                    if (string.Equals(process.ProcessName, suffix, StringComparison.OrdinalIgnoreCase)) pids.Add((uint)process.Id);
+                }
+                catch
+                {
+                    // a process can exit between enumeration and the name read
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        if (pids.Count == 0)
+        {
+            Log("no running process named " + suffix + ": nothing raised");
+            return 1;
+        }
+
+        IntPtr target = Scan(false);
+        if (target == IntPtr.Zero)
+        {
+            Log("no window belongs to " + suffix + ": nothing raised");
+            return 2;
+        }
+
+        bool iconic = IsIconic(target);
+        bool hidden = !IsWindowVisible(target) && !iconic;
+        bool woken = false;
+
+        if (hidden)
+        {
+            woken = WakeViaSecondInstance(target);
+            if (!woken)
+            {
+                try { ShowWindowAsync(target, SW_SHOW); } catch { }
+                SysCommand(target, SC_RESTORE);
+            }
+        }
+        else if (iconic)
+        {
+            if (!SysCommand(target, SC_RESTORE))
+            {
+                try { ShowWindowAsync(target, SW_RESTORE); } catch { }
+            }
+        }
+
+        IntPtr raised = Scan(true);
+        if (raised == IntPtr.Zero) raised = target;
+        bool focused = Focus(raised);
+        Log("raised " + Describe(raised) + " hidden=" + hidden + " iconic=" + iconic + " woken=" + woken
+            + " focused=" + focused + " foreground=" + AlreadyFocused(raised));
+        return focused ? 0 : 3;
+    }
+}
+`
+
+/**
+ * The raiser's C# was ~13 KB and used to be inlined into EVERY card script,
+ * making each generated .ps1 ~28 KB and recompiling the same type on every
+ * click. It now lives in one cached .cs file under the plugin's temp directory;
+ * ring() writes it (once per source hash) and the card compiles it with
+ * Add-Type -LiteralPath. The filename is keyed to the source hash, so a new
+ * plugin build can never load a stale type.
+ */
+export const RAISE_CSHARP_SOURCE = RAISE_CSHARP.trim()
+export function raiseCacheFile() {
+  const hash = createHash('sha256').update(RAISE_CSHARP_SOURCE).digest('hex').slice(0, 12)
+  return join(tmpdir(), 'dsh-attention', `attention-raise-${hash}.cs`)
+}
+
+/**
+ * ring() is the normal writer, but buildScript is also called directly by the
+ * shipped screenshot driver and by standalone dev scripts. Ensuring the cache
+ * from buildScript itself keeps ANY generated card runnable on a fresh machine.
+ */
+export function ensureRaiserCache() {
+  const dir = join(tmpdir(), 'dsh-attention')
+  mkdirSync(dir, { recursive: true })
+  const file = raiseCacheFile()
+  try {
+    if (!existsSync(file) || readFileSync(file, 'utf8') !== RAISE_CSHARP_SOURCE) {
+      writeFileSync(file, RAISE_CSHARP_SOURCE, 'utf8')
+    }
+  } catch {
+    /* the card will surface a clear Add-Type error if the cache is unavailable */
+  }
+  return file
 }
 
 /**
@@ -216,14 +664,29 @@ export function buildScript(cfg, title, body, tone = 'ok') {
     // the Shown handler and a fast timer re-assert it for the card's lifetime.
     lines.push('Add-Type -TypeDefinition \'using System;using System.Runtime.InteropServices;public class AttentionDpi{[DllImport("user32.dll")]public static extern bool SetProcessDPIAware();[DllImport("user32.dll")]public static extern bool SetWindowPos(IntPtr h,IntPtr after,int x,int y,int cx,int cy,uint flags);[DllImport("user32.dll")]public static extern int GetWindowLong(IntPtr h,int n);[DllImport("user32.dll")]public static extern int SetWindowLong(IntPtr h,int n,int v);[DllImport("user32.dll")]public static extern IntPtr GetWindow(IntPtr h,uint cmd);[DllImport("user32.dll")]public static extern bool IsWindowVisible(IntPtr h);[DllImport("user32.dll")]public static extern IntPtr GetForegroundWindow();[DllImport("user32.dll")]public static extern bool SetForegroundWindow(IntPtr h);[DllImport("kernel32.dll")]public static extern uint GetCurrentThreadId();[DllImport("user32.dll")]public static extern bool AttachThreadInput(uint a,uint b,bool f);[DllImport("user32.dll")]public static extern bool ShowWindow(IntPtr h,int n);[DllImport("user32.dll")]public static extern bool IsIconic(IntPtr h);[DllImport("user32.dll")]public static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);}\'')
     lines.push('$null=[AttentionDpi]::SetProcessDPIAware()')
-    // Clicking the card should take you to the thing waiting for you. Only the
-    // foreground window may hand focus to another process, and the card becomes
-    // the foreground window the moment it is clicked — which is why this runs
-    // inside the card's click handler rather than from the host, where a
-    // background SetForegroundWindow would silently do nothing (Windows only
-    // flashes the taskbar button for background callers).
-    const target = String(cfg.focusProcess ?? 'DeepSeek Harness').replace(/'/g, "''")
-    lines.push(`function FocusDsh(){ foreach($p in Get-Process -Name '${target}' -ErrorAction SilentlyContinue){ if($p.MainWindowHandle -ne [IntPtr]::Zero){ if([AttentionDpi]::IsIconic($p.MainWindowHandle)){ [void][AttentionDpi]::ShowWindow($p.MainWindowHandle,9) }; [void][AttentionDpi]::SetForegroundWindow($p.MainWindowHandle); return } } }`)
+    // Clicking the card should take you to the thing waiting for you — including
+    // when that window is no longer on screen. Only the foreground window may
+    // hand focus to another process, and the card becomes the foreground window
+    // the moment it is clicked, which is why this runs inside the card's click
+    // handler rather than from the host, where a background SetForegroundWindow
+    // would silently do nothing (Windows only flashes the taskbar button for
+    // background callers).
+    //
+    // The raiser is compiled C# rather than a Get-Process loop. MainWindowHandle
+    // is 0 for a window the app hid itself, so the loop had nothing to act on and
+    // the click was a no-op; see RAISE_CSHARP above for the whole story.
+    const target = String(cfg.focusProcess ?? 'DeepSeek Harness')
+    const raiseLog = cfg.raiseLog === '' ? '' : String(cfg.raiseLog ?? DEFAULT_RAISE_LOG)
+    // The C# source is NOT inlined here: buildScript() has just written it to a
+    // hash-named .cs file (see ensureRaiserCache). The card carries only the path,
+    // so each generated .ps1 is ~15 KB instead of ~28 KB and Add-Type reads a
+    // cached file rather than recompiling 13 KB of in-script text.
+    const cacheCs = ensureRaiserCache()
+    lines.push(`$raiseCs=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(cacheCs)}')); Add-Type -LiteralPath $raiseCs`)
+    lines.push(
+      `function FocusDsh(){ $null=[AttentionRaise]::Run([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(target)}')),[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(raiseLog)}'))) }`,
+    )
+
     // Raising the window lands on whatever session the page last showed. The
     // click therefore also POSTs the card's one-shot token to the host's jump
     // route; the page's client half polls that queue and opens the exact
@@ -1126,6 +1589,10 @@ export function ring(cfg, title, body, logger, tone = 'ok') {
     // BOM is what makes Windows PowerShell 5.1 open it as UTF-8 rather than ANSI.
     const dir = join(tmpdir(), 'dsh-attention')
     mkdirSync(dir, { recursive: true })
+    // One cached .cs per raiser-source hash. ensureRaiserCache() rewrites a
+    // missing OR truncated cache, so delivery stays self-healing; a changed
+    // RAISE_CSHARP (new plugin version) gets a new filename automatically.
+    ensureRaiserCache()
     const scriptFile = join(dir, `card-${process.pid}-${Date.now()}.ps1`)
     // The child deletes its own script when it finishes. Doing it from here would
     // race the child's own read of the file, and a crash on our side must not

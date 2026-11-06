@@ -105,7 +105,7 @@ function rect(width, height, left = 0, top = 0) {
 
 // ---------------------------------------------------------------- scenarios
 
-function buildDom(kind) {
+function buildDom(kind, opts = {}) {
   const root = el('body');
   const frame = root.append(el('div', { 'data-frame': '' }, { className: 'frame' }));
   const centerCol = frame.append(el('div', {}, { className: 'centerCol' }));
@@ -166,9 +166,14 @@ function buildDom(kind) {
     strip.append(el('button', { role: 'tab', 'aria-selected': 'true' }, { text: 'Kontext' }));
   }
 
+  // `hiddenStart` models the tray case: the renderer exists, its timers are
+  // parked, and the page only becomes visible when something raises the
+  // window. `noEvents` models an older shell where the event surface is missing
+  // — the client must still poll on its timer instead of throwing.
+  const listeners = new Map();
   const document = {
     baseURI: 'http://dsh.test/app/',
-    visibilityState: 'visible',
+    visibilityState: opts.hiddenStart === true ? 'hidden' : 'visible',
     body: root,
     querySelectorAll(selector) {
       return root.querySelectorAll(selector);
@@ -180,6 +185,23 @@ function buildDom(kind) {
       return pointTarget;
     },
   };
+  if (opts.noEvents !== true) {
+    document.addEventListener = (type, fn) => {
+      const list = listeners.get(type) ?? [];
+      list.push(fn);
+      listeners.set(type, list);
+    };
+    document.removeEventListener = (type, fn) => {
+      const list = listeners.get(type);
+      if (list === undefined) return;
+      const at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+    document.__listeners = (type) => (listeners.get(type) ?? []).length;
+    document.__fire = (type) => {
+      for (const fn of [...(listeners.get(type) ?? [])]) fn();
+    };
+  }
 
   return { document, root, pointTarget };
 }
@@ -193,9 +215,15 @@ async function run(kind, extraCtx = {}) {
  * Same as run(), with a controllable session list so the `landed` verdict can
  * be tested for real: whether openSession actually moves the main view, and
  * whether an unmoving shell is reported as a failure instead of a success.
+ *
+ * `pageOpts` drives the tray case: `hiddenStart` starts the page invisible,
+ * `parkCadence` stops the one-second cadence from ever firing (a background
+ * renderer parked by Chromium), `revealMs` waits that long and then flips the
+ * page visible and fires `visibilitychange`, and `noEvents` removes the event
+ * surface entirely, as an older shell would.
  */
-async function runWith(kind, extraCtx = {}, sessionOpts = {}) {
-  const { document } = buildDom(kind);
+async function runWith(kind, extraCtx = {}, sessionOpts = {}, pageOpts = {}) {
+  const { document } = buildDom(kind, pageOpts);
   const reports = [];
   const calls = [];
   let served = 0;
@@ -213,18 +241,25 @@ async function runWith(kind, extraCtx = {}, sessionOpts = {}) {
     Boolean,
     Promise,
     Error,
-    fetch: async (url, opts) => {
+    fetch: async (url, fetchOpts) => {
       const target = String(url);
       if (target.includes('dsh-attention/ping')) {
-        reports.push(JSON.parse(opts.body));
+        reports.push(JSON.parse(fetchOpts.body));
         return { status: 200, json: async () => ({}) };
       }
+      // Serves the claim on the FIRST ask, visible or not: whether a hidden
+      // page asks at all is exactly what these scenarios are measuring.
       served += 1;
       if (served === 1) return { status: 200, json: async () => ({ sessionId: 'sess-1', jumpId: 'jump-1' }) };
       return { status: 204, json: async () => ({}) };
     },
     // Time-scaled timers keep the ordering identical while making the suite fast.
-    setTimeout: (fn, ms = 0) => setTimeout(fn, Math.max(0, Math.round(ms / 20))),
+    setTimeout: (fn, ms = 0) => {
+      // `parkCadence`: Chromium throttles a background renderer's timers; the
+      // one-second poll simply does not run until the page is visible again.
+      if (pageOpts.parkCadence === true && ms >= 900) return 0;
+      return setTimeout(fn, Math.max(0, Math.round(ms / 20)));
+    },
     clearTimeout: (id) => clearTimeout(id),
   };
 
@@ -289,15 +324,25 @@ async function runWith(kind, extraCtx = {}, sessionOpts = {}) {
   };
 
   const dispose = module.apply(ctx);
+  const listenersAfterApply = typeof document.__listeners === 'function' ? document.__listeners('visibilitychange') : -1;
+  if (pageOpts.revealMs !== undefined) {
+    // The page sat hidden this long — a background renderer, timers parked —
+    // and then something raised the window. That is the moment the claim has
+    // to be collected.
+    await new Promise((resolve) => setTimeout(resolve, pageOpts.revealMs));
+    document.visibilityState = 'visible';
+    if (typeof document.__fire === 'function') document.__fire('visibilitychange');
+  }
   await new Promise((resolve) => setTimeout(resolve, 400));
   if (typeof dispose === 'function') dispose();
+  const listenersAfterDispose = typeof document.__listeners === 'function' ? document.__listeners('visibilitychange') : -1;
 
   const steps = {};
   for (const report of reports) {
     const { event, ...rest } = report;
     steps[event] = rest;
   }
-  return { steps, calls, reports };
+  return { steps, calls, reports, served, listenersAfterApply, listenersAfterDispose };
 }
 
 // ---------------------------------------------------------------- assertions
@@ -430,6 +475,55 @@ function check(name, condition, detail) {
     check('jump still attempted', calls.some((c) => c[0] === 'openSession'), JSON.stringify(calls));
     check('verdict is not a false failure', steps['step:landed']?.landed === false, JSON.stringify(steps['step:landed']));
     check('marked as unreadable', steps['step:landed']?.readable === false, JSON.stringify(steps['step:landed']));
+  }
+
+  // 12. THE TRAY CASE. The card is clicked while the window is hidden, so the
+  //     renderer is a background one: Chromium throttles its timers and the
+  //     one-second poll does not run. Everything therefore depends on the page
+  //     polling the moment it becomes visible again. parkCadence freezes the
+  //     cadence, hiddenStart starts the page invisible, revealMs flips it
+  //     visible mid-test: the jump must still land. Against a client with no
+  //     visibilitychange wiring this collects nothing at all — it is the
+  //     regression this whole block exists for.
+  console.log('\n[12] woken from the tray: poll on visibilitychange');
+  {
+    const { calls, served, listenersAfterApply } = await runWith(
+      'clean',
+      {},
+      {},
+      { hiddenStart: true, parkCadence: true, revealMs: 200 },
+    );
+    check('the page subscribed to visibilitychange', listenersAfterApply === 1, String(listenersAfterApply));
+    check('the woken page collected the claim', calls.some((c) => c[0] === 'openSession' && c[1] === 'sess-1'), JSON.stringify(calls));
+    check('and it collected exactly the one claim', served === 1, String(served));
+  }
+
+  // 12b. Same page, never revealed: a hidden renderer must NOT navigate a
+  //      window nobody is looking at. If it collected the claim here, the
+  //      visibility guard is gone and the foreground page loses the jump.
+  console.log('\n[12b] parked and never woken: nothing is collected');
+  {
+    const { calls, served } = await runWith('clean', {}, {}, { hiddenStart: true, parkCadence: true });
+    check('no fetch happened while hidden', served === 0, String(served));
+    check('no session was opened', !calls.some((c) => c[0] === 'openSession'), JSON.stringify(calls));
+  }
+
+  // 13. An older shell without the DOM event surface: registering must degrade
+  //     to the timer, not throw at apply() and take the whole bundle down.
+  console.log('\n[13] no addEventListener in this shell');
+  {
+    const { calls, steps } = await runWith('clean', {}, {}, { noEvents: true });
+    check('the timer still carried the jump', calls.some((c) => c[0] === 'openSession' && c[1] === 'sess-1'), JSON.stringify(calls));
+    check('and it reported normally', steps['step:landed']?.landed === true, JSON.stringify(steps['step:landed']));
+  }
+
+  // 14. Disposal has to unregister, or a hot-reloaded bundle leaves a listener
+  //     per apply() polling a dead context.
+  console.log('\n[14] dispose unregisters the listener');
+  {
+    const { listenersAfterApply, listenersAfterDispose } = await runWith('clean', {}, {}, {});
+    check('one listener registered', listenersAfterApply === 1, String(listenersAfterApply));
+    check('none left after dispose', listenersAfterDispose === 0, String(listenersAfterDispose));
   }
 
   console.log(`\n${failures.length === 0 ? 'ALL SCENARIOS PASS' : `${failures.length} FAILURE(S)`}`);

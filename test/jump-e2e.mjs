@@ -37,7 +37,19 @@ const fired = []
 const host = createHarness({ agents: [{ id: 'root', root: true }] })
 applyHost(host.ctx, {
   spawn: (_file, args) => {
-    fired.push(Buffer.from(args.at(-1), 'base64').toString('utf16le'))
+    // The card script travels through a FILE, not a base64 -EncodedCommand:
+    // the painted card outgrew the command-line limit. Read it back off disk
+    // and strip the UTF-8 BOM, exactly as ring() writes it (test/run.mjs does
+    // the same for its spawn capture).
+    const at = args.indexOf('-File')
+    const scriptFile = at === -1 ? undefined : args[at + 1]
+    if (scriptFile !== undefined) {
+      try {
+        fired.push(readFileSync(scriptFile, 'utf8').replace(/^\ufeff/, ''))
+      } catch {
+        fired.push('')
+      }
+    }
     return { on() {}, unref() {} }
   },
 })
@@ -64,7 +76,15 @@ check('the host accepts the click', click.status === 204, String(click.status))
 // ---- 3. the page half: load the REAL client.js -----------------------------
 let module
 globalThis.window = { __ModuleLoader__: { load: (m) => { module = m } } }
-globalThis.document = { baseURI: 'http://127.0.0.1:24227/' }
+globalThis.document = {
+  baseURI: 'http://127.0.0.1:24227/',
+  // The page half guards on visibility: a shell that does not report itself
+  // visible never asks for a claim, which is exactly the tray behaviour —
+  // covered by test/jump-dom.cjs scenario 12, not by this seam test.
+  visibilityState: 'visible',
+  addEventListener() {},
+  removeEventListener() {},
+}
 globalThis.fetch = async (url) => {
   const path = new URL(url).pathname
   const result = await host.serve('GET', path)
