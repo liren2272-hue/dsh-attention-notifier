@@ -14,6 +14,16 @@
         notifyOnQuestion: true
         notifyOnApproval: true
         notifyOnTurnEnd: true
+        # A turn that a MACHINE started — a goal resume, another agent's message,
+        # a team message, a subagent landing, a webhook delivery, a schedule, a
+        # background job settling, or the cordis host runner — has no human
+        # watching it begin, so a card about how that work ended is addressed to
+        # nobody. Turns whose `user/message` source is machine-side are exempted
+        # from the turn-end card entirely. A turn with NO source on record is NOT
+        # exempted: the event may simply never have arrived, and going quiet
+        # there would silence the notifier on exactly the turns it exists to
+        # announce. Set false to ring on every ending again.
+        exemptExecutionTurns: true
         includeSummary: true
         askGuidance: true
         # Registers the `attention_popup` tool: one call fires one card right

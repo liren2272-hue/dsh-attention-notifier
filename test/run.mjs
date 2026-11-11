@@ -279,6 +279,148 @@ function decodeTitle(script) {
   check('a failed turn rings', rings.length === 2, `rings=${rings.length}`)
 }
 
+// ---- 11b. turns a machine started are not worth a card -------------------
+
+{
+  // Every source kind the client labels as a trigger rather than a message:
+  // a machine decided to work, so a card about how that work ended has no
+  // reader. Each is asserted against an ERRORING turn — the red card that
+  // made the exemption worth asking for — so the check cannot pass by simply
+  // noticing a quiet `completed`.
+  const machineKinds = [
+    'goal',
+    'agent-message',
+    'team-message',
+    'subagent-settled',
+    'webhook',
+    'schedule',
+    'tool-jobs',
+    'cordis-host-runner',
+    'dsh-continue-on-truncate',
+  ]
+  for (const kind of machineKinds) {
+    const { harness, rings } = setup({ config: { minIntervalMs: 0 } })
+    harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind } } })
+    harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: { kind: 'error' } } })
+    check(`a ${kind}-triggered turn does not ring`, rings.length === 0, `rings=${rings.length}`)
+  }
+}
+
+{
+  // The human's own kinds must be untouched: the exemption is about who
+  // started the turn, not about the ending.
+  const humanKinds = ['user', 'working-directory', 'user-approval', 'user-question-reply']
+  for (const kind of humanKinds) {
+    const { harness, rings } = setup({ config: { minIntervalMs: 0 } })
+    harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind } } })
+    harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+    check(`a ${kind}-triggered turn still rings`, rings.length === 1, `rings=${rings.length}`)
+  }
+}
+
+{
+  // Backwards compatibility: no source on record is NOT an execution trigger.
+  // The event may simply never have arrived, and going quiet there would
+  // silence the notifier on exactly the turns it exists to announce.
+  const { harness, rings } = setup({ config: { minIntervalMs: 0 } })
+  harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+  check('a turn with no user/message on record still rings', rings.length === 1, `rings=${rings.length}`)
+
+  const blank = setup({ config: { minIntervalMs: 0 } })
+  blank.harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: {} })
+  blank.harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+  check('a user/message with no source still rings', blank.rings.length === 1, `rings=${blank.rings.length}`)
+}
+
+{
+  // The knob still exists for a profile that wants every ending told.
+  const { harness, rings } = setup({ config: { minIntervalMs: 0, exemptExecutionTurns: false } })
+  harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind: 'schedule' } } })
+  harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+  check('exemptExecutionTurns:false rings an execution turn anyway', rings.length === 1, `rings=${rings.length}`)
+}
+
+{
+  // The trigger is consumed with the turn: a later human turn must not be
+  // judged by the previous turn's trigger.
+  const { harness, rings } = setup({ config: { minIntervalMs: 0 } })
+  harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind: 'schedule' } } })
+  harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+  check('the execution turn is quiet', rings.length === 0, `rings=${rings.length}`)
+  harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind: 'user' } } })
+  harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+  check('the next human turn still rings', rings.length === 1, `rings=${rings.length}`)
+}
+
+{
+  // REGRESSION (2026-11-11): the trigger is the message that STARTED the
+  // turn, not the last one that arrived. A human reply injected mid-turn used
+  // to overwrite the machine trigger and announce a turn nobody watched --
+  // the auto-continue case, where the human is waiting for their own answer.
+  const { harness, rings } = setup({ config: { minIntervalMs: 0 } })
+  harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind: 'dsh-continue-on-truncate' } } })
+  harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind: 'user' } } })
+  harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+  check(
+    'a machine trigger survives a mid-turn human message',
+    rings.length === 0,
+    `rings=${rings.length}`,
+  )
+}
+
+{
+  // ...and the mirror: a human message that opens the turn is still the
+  // trigger when a machine message arrives later in the same turn.
+  const { harness, rings } = setup({ config: { minIntervalMs: 0 } })
+  harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind: 'user' } } })
+  harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind: 'schedule' } } })
+  harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+  check(
+    'a human trigger survives a mid-turn machine message',
+    rings.length === 1,
+    `rings=${rings.length}`,
+  )
+}
+
+{
+  // REGRESSION (2026-11-11): the real host sends human-side kinds that were
+  // never in this plugin's human allow-list. Inverting the exemption against
+  // that list classified them as machine triggers and silenced every card.
+  // The exemption must be default-open: only EXECUTION_TRIGGER_KINDS is silent.
+  for (const kind of ['skill-catalog', 'time-context', 'dsh-mnemon', 'some-future-kind']) {
+    const { harness, rings } = setup({ config: { minIntervalMs: 0 } })
+    harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind } } })
+    harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+    check(`a non-execution kind (${kind}) still rings`, rings.length === 1, `rings=${rings.length}`)
+  }
+}
+
+{
+  // The machine list itself stays complete: every kind the client labels a
+  // trigger is still silent.
+  for (const kind of ['goal', 'agent-message', 'team-message', 'subagent-settled', 'webhook', 'schedule', 'tool-jobs', 'cordis-host-runner', 'dsh-continue-on-truncate']) {
+    const { harness, rings } = setup({ config: { minIntervalMs: 0 } })
+    harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind } } })
+    harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+    check(`an execution kind (${kind}) stays silent`, rings.length === 0, `rings=${rings.length}`)
+  }
+}
+
+{
+  // The exemption is supposed to be silent, but "it stayed quiet because a
+  // schedule started it" and "it never fired" must stay tellable apart.
+  const traceFile = join(tmpdir(), `dsh-attention-exempt-test-${process.pid}.log`)
+  const { harness, rings } = setup({ config: { minIntervalMs: 0, trace: true, traceFile } })
+  harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind: 'schedule' } } })
+  harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+  check(
+    'the exemption is traced, not silent',
+    rings.length === 0 && readFileSync(traceFile, 'utf8').includes('suppressed:execution-trigger'),
+    `rings=${rings.length}`,
+  )
+  rmSync(traceFile, { force: true })
+}
+
 // ---- 12. the config surface is safe to hand-edit -------------------------
 
 {

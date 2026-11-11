@@ -89,6 +89,15 @@ const DEFAULTS = {
   notifyOnQuestion: true,
   notifyOnApproval: true,
   notifyOnTurnEnd: true,
+  // A turn that was STARTED by something other than the human — another agent
+  // message, a schedule, a webhook, a goal resume, a subagent landing, a team
+  // message, a background job or a plugin runner — has no human watching it
+  // begin, so its "task finished" card is noise that trains the reader to
+  // ignore the ring. Exempt those turns entirely. Only confirmed execution
+  // triggers are exempted: when no `user/message` source is on record (the
+  // event never arrived, or the host does not send one) the plugin keeps its
+  // old behaviour and rings.
+  exemptExecutionTurns: true,
   includeSummary: true,
   askGuidance: true,
   // Register the `attention_popup` tool: one call fires one card, so delivery
@@ -302,10 +311,65 @@ function toneOfEnding(reason) {
   return kind === 'completed' ? 'ok' : 'alert'
 }
 
+/**
+ * The source kinds that mean a TURN STARTED WITHOUT THE HUMAN.
+ *
+ * These are the ones the client itself labels as a trigger rather than a
+ * message: a goal resume, another agent's message, a team message, a subagent
+ * landing, a webhook delivery, a scheduled run, a background job settling, or
+ * the cordis host runner. Every one of them is a machine deciding to work; a
+ * card about how that work ended is addressed to nobody.
+ *
+ * `dsh-continue-on-truncate` is in here too, even though the human is watching:
+ * that plugin opens a FRESH turn to finish an answer that hit the output token
+ * limit, so its `user/message` carries a non-'user' source kind. The turn it
+ * starts is a continuation of work the machine already began, so its ending is
+ * not the event the reader is waiting for — the chain's own end is.
+ *
+ * This set is now the SINGLE SOURCE OF TRUTH for `isExecutionTrigger`. Add a
+ * kind here only when the client really labels it a machine trigger — never
+ * "because it looks like a machine". An unknown or human-side kind (the real
+ * host sends skill-catalog, time-context, dsh-mnemon, …) MUST keep ringing,
+ * because silence is the failure mode this plugin exists to prevent.
+ */
+const EXECUTION_TRIGGER_KINDS = new Set([
+  'goal',
+  'agent-message',
+  'team-message',
+  'subagent-settled',
+  'webhook',
+  'schedule',
+  'tool-jobs',
+  'cordis-host-runner',
+  'dsh-continue-on-truncate',
+])
+
+/**
+ * Did something other than the human start this turn?
+ *
+ * Only the kinds in EXECUTION_TRIGGER_KINDS (the ones the client itself labels
+ * as machine triggers) exempt a finished turn. Every other kind — including
+ * kinds this plugin has never heard of — RINGS. That default-open behaviour is
+ * deliberate: a turn whose `user/message` carried no source is indistinguishable
+ * from a turn the plugin was simply never told about, and an unrecognised kind
+ * is not evidence of a machine. The real host sends human-side kinds
+ * (skill-catalog, time-context, dsh-mnemon, …) that are absent from any
+ * human allow-list, so inverting against such a list silences exactly those
+ * turns — that inversion is the regression this fixes.
+ */
+function isExecutionTrigger(kind) {
+  if (typeof kind !== 'string' || kind === '') return false
+  return EXECUTION_TRIGGER_KINDS.has(kind)
+}
+
 export function apply(ctx, rawConfig) {
   const cfg = resolveConfig(ctx, rawConfig)
   const now = () => Date.now()
   const lastAssistant = new Map()
+  // The source kind of the message that started each session's current turn.
+  // Read off `user/message` so a turn that a machine began can be told apart
+  // from one the human began.
+  const triggerKinds = new Map()
   const lastNotified = new Map()
   const pending = new Map()
   // STACKING ORDINAL. How many cards are on screen right now, handed to each new
@@ -1000,23 +1064,54 @@ export function apply(ctx, rawConfig) {
       if (text !== '') lastAssistant.set(session.id, text)
       return
     }
+    if (type === 'user/message') {
+      // Record the trigger so the turn's own ending can decide whether a card
+      // is addressed to anybody. The source is what the client reads too.
+      //
+      // FIRST message of the turn wins. The plugin asks "who STARTED this
+      // turn", and that is the message that opened it -- a human reply that
+      // arrives mid-turn is a reader of the answer, not the starter. Letting
+      // the last message overwrite the trigger announced a machine-started
+      // turn whenever the human steered one in: the auto-continue case, where
+      // the human is waiting for their own answer and is not watching a
+      // machine finish.
+      const kind = data?.source?.kind
+      if (typeof kind === 'string' && kind !== '' && !triggerKinds.has(session.id)) {
+        triggerKinds.set(session.id, kind)
+      }
+      return
+    }
     if (type !== 'turn/end') return
 
     const summary = lastAssistant.get(session.id) ?? ''
+    const trigger = triggerKinds.get(session.id)
     if (cfg.notifyOnTurnEnd && isRootAgent(session.id) && worthRinging(data.reason)) {
-      const reason = describeReason(data.reason)
-      const key = `turn:${session.id}`
-      if (shouldNotify(key)) {
-        const detail = cfg.includeSummary && summary !== '' ? clip(summary, 180) : ''
-        notify(
-          cfg.title,
-          detail === '' ? `任务结束：${reason}` : `任务结束（${reason}）：${detail}`,
-          toneOfEnding(data.reason),
-          session.id,
-        )
+      if (cfg.exemptExecutionTurns && isExecutionTrigger(trigger)) {
+        // A machine started this turn, so a card about how it ended has no
+        // reader. Counted once per session-trigger pair: the exemption is
+        // supposed to be silent, but "it stayed quiet because a schedule
+        // started it" and "it stayed quiet because it never fired" must stay
+        // distinguishable in the trace.
+        once(`exempt:execution-trigger:${session.id}:${trigger}`, 'suppressed:execution-trigger', {
+          sessionId: session.id,
+          trigger,
+        })
+      } else {
+        const reason = describeReason(data.reason)
+        const key = `turn:${session.id}`
+        if (shouldNotify(key)) {
+          const detail = cfg.includeSummary && summary !== '' ? clip(summary, 180) : ''
+          notify(
+            cfg.title,
+            detail === '' ? `任务结束：${reason}` : `任务结束（${reason}）：${detail}`,
+            toneOfEnding(data.reason),
+            session.id,
+          )
+        }
       }
     }
     lastAssistant.delete(session.id)
+    triggerKinds.delete(session.id)
     cancelPending(`question:${session.id}`)
     cancelPending(`approval:${session.id}`)
   })
@@ -1026,6 +1121,7 @@ export function apply(ctx, rawConfig) {
     const agent = payload?.agent
     if (!agent) return
     lastAssistant.delete(agent.id)
+    triggerKinds.delete(agent.id)
     cancelPending(`question:${agent.id}`)
     cancelPending(`approval:${agent.id}`)
   })

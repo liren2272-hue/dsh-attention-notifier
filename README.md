@@ -57,6 +57,7 @@ pnpm add @liren2272/dsh-attention
         notifyOnQuestion: true
         notifyOnApproval: true
         notifyOnTurnEnd: true
+        exemptExecutionTurns: true
         focusProcess: 'DeepSeek Harness'
         jump: true
 ```
@@ -95,6 +96,7 @@ git clone https://github.com/liren2272-hue/dsh-attention-notifier.git
 | `notifyOnQuestion` | `true` | agent 提问时响 |
 | `notifyOnApproval` | `true` | 工具请求批准时响 |
 | `notifyOnTurnEnd` | `true` | 任务结束时响 |
+| `exemptExecutionTurns` | `true` | 由机器触发源（目标续跑、收到任务消息、团队消息、子任务状态、外部事件、自动化任务、后台任务、插件状态、输出达上限后的自动续写）开始的回合不再弹结束卡片；人工输入的回合照旧响。没有任何触发源记录时也照旧响（宁可多响，不可静默） |
 | `includeSummary` | `true` | 结束卡片带上最后一条回复的摘要 |
 | `askGuidance` | `true` | 往系统提示词里注入「何时该问用户」的规则 |
 | `minIntervalMs` | `4000` | 同类通知的合并窗口（连问三次只响一次） |
