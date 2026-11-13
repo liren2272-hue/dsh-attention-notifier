@@ -327,11 +327,6 @@ function toneOfEnding(reason) {
  * the cordis host runner. Every one of them is a machine deciding to work; a
  * card about how that work ended is addressed to nobody.
  *
- * `dsh-continue-on-truncate` is in here too, even though the human is watching:
- * that plugin opens a FRESH turn to finish an answer that hit the output token
- * limit, so its `user/message` carries a non-'user' source kind. The turn it
- * starts is a continuation of work the machine already began, so its ending is
- * not the event the reader is waiting for — the chain's own end is.
  *
  * This set is now the SINGLE SOURCE OF TRUTH for `isExecutionTrigger`. Add a
  * kind here only when the client really labels it a machine trigger — never
@@ -356,7 +351,18 @@ const EXECUTION_TRIGGER_KINDS = new Set([
   'schedule',
   'tool-jobs',
   'cordis-host-runner',
-  'dsh-continue-on-truncate',
+  // NOTE: 'dsh-continue-on-truncate' is intentionally NOT an execution trigger.
+  // When an answer hits the output-token limit, that plugin opens a FRESH turn
+  // (source.kind === 'dsh-continue-on-truncate') to finish the very same answer,
+  // and a long answer can chain several of these. Each INTERMEDIATE segment ends
+  // in reason.kind === 'max-tokens', which worthRinging() already silences -- so
+  // the only turn in the chain that would ever ring is the FINAL one, the segment
+  // that ends 'completed' and carries the answer the human has been waiting for.
+  // Gating the kind here wrongly silenced exactly that completion (the chain's
+  // real end), the same over-exemption 'subagent-settled' had. Removing it lets
+  // the chain's finished answer ring while the throwaway truncated middles stay
+  // quiet. A continuation that ends 'interrupted'/'aborted' now rings too -- the
+  // human was waiting and did not get the answer, which is worth a word.
 ])
 
 /**
