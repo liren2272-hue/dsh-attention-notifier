@@ -68,7 +68,11 @@ function makeRings() {
  * feature with thousands of lines that were never delivered to anyone. Scenarios
  * that test the trace pass their own `traceFile` and win by spreading after this.
  */
-function setup({ config = {}, agents = [], tools = null, initiator = undefined, sessions = null } = {}) {
+// The default harness models a ROOT conversation: the real host keeps the
+// root agent registered, so its `turn/end` legitimately rings. Tests that need
+// a different shape (a delegated child, a bare non-root session) pass their own
+// `agents` array, which overrides this default.
+function setup({ config = {}, agents = [{ id: 's1', root: true }], tools = null, initiator = undefined, sessions = null } = {}) {
   const { rings, spawn } = makeRings()
   const harness = createHarness({ agents, tools, initiator, sessions })
   apply(harness.ctx, { spawn, logFile: '', trace: false, ...config })
@@ -208,6 +212,79 @@ function decodeTitle(script) {
   check('the root agent finishing rings', parent.rings.length === 1, `rings=${parent.rings.length}`)
 }
 
+// ---- 7b. a disposed background agent's turn/end stays silent --------------
+//
+// A background job / subagent (Mnemon runs, idle checkpoints, skill drafts)
+// often reaches `turn/end` AFTER its agent record has been disposed, so
+// `agents.get(id)` is `undefined`. The old gate treated "can't resolve" as
+// "must be root" and rang the human for delegated work — the exact noise this
+// plugin exists to suppress. turn/end is a low-value chime, so the strict gate
+// stays silent when the agent can't be positively confirmed as root. A real
+// root conversation always has its agent registered (the host keeps it live),
+// so this never silences a legitimate root chime.
+
+{
+  // agents service present, but the finishing agent is already gone.
+  const { harness, rings } = setup({ agents: [{ id: 'other', root: true }] })
+  harness.emit('session/event', { id: 'gone' }, { type: 'turn/end', data: { reason: 'completed' } })
+  check('a disposed background agent finishing does not ring', rings.length === 0, `rings=${rings.length}`)
+  check('...even when the reason is an error', (() => {
+    const r = setup({ agents: [{ id: 'other', root: true }] })
+    r.harness.emit('session/event', { id: 'gone' }, { type: 'turn/end', data: { reason: { kind: 'error' } } })
+    return r.rings.length === 0
+  })(), 'error reason must not resurrect the chime')
+}
+
+// ---- 7c. roots() returning undefined must not silence a live conversation --
+//
+// The real host intermittently exposes `agents.roots()` as `undefined` even for
+// a LIVE human conversation (trace: `gate:no-roots rootsType:"undefined"`). The
+// agent record is still registered in that case -- only the roots enumeration
+// is missing. Silencing turn/end here swallowed the completion card for the
+// main conversation. This scenario reproduces exactly that host shape.
+{
+  const { harness, rings } = setup({ agents: [{ id: 's1', root: true }] })
+  // Break ONLY the roots enumeration; `agents.get('s1')` still resolves.
+  harness.ctx.get('agents').roots = () => undefined
+  harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+  check(
+    'a live conversation rings even when roots() is undefined',
+    rings.length === 1,
+    `rings=${rings.length}`,
+  )
+}
+
+// ---- 7d. a STILL-REGISTERED subagent's turn/end stays silent --------------
+//
+// The exempt-probe subagent on the real host reached turn/end while its agent
+// record was STILL registered, so it was a member of `roots()` and
+// `roots().includes(agent)` returned true -- the record-based gate waved it
+// through and rang the human for delegated work. What distinguishes it from the
+// human is the ID SHAPE: the host registers a human main conversation under
+// `session-<uuid>`, but a subagent under a bare uuid. This reproduces that exact
+// shape: a bare-uuid agent, fully registered, present in roots().
+{
+  const subagentId = '27dd9e09-9b8c-40d9-9abe-f13d7294df89'
+  const { harness, rings } = setup({ agents: [{ id: subagentId, root: true }] })
+  // The record resolves AND roots() enumerates it -- every record-based check
+  // passes. Only the id shape gives it away.
+  harness.emit('session/event', { id: subagentId }, { type: 'turn/end', data: { reason: 'completed' } })
+  check(
+    'a still-registered bare-uuid subagent does not ring',
+    rings.length === 0,
+    `rings=${rings.length}`,
+  )
+  // ...and the human conversation it was delegated from still rings, same shape
+  // as the real host (`session-9676d526-…`).
+  const human = setup({ agents: [{ id: 'session-9676d526-145c-4373-8a4a-48b6587c4d7d', root: true }] })
+  human.harness.emit('session/event', { id: 'session-9676d526-145c-4373-8a4a-48b6587c4d7d' }, { type: 'turn/end', data: { reason: 'completed' } })
+  check(
+    'a session- prefixed human conversation still rings',
+    human.rings.length === 1,
+    `rings=${human.rings.length}`,
+  )
+}
+
 // ---- 8. every switch can be turned off ----------------------------------
 
 {
@@ -237,7 +314,7 @@ function decodeTitle(script) {
 // ---- 10. delivery failure is contained ----------------------------------
 
 {
-  const harness = createHarness()
+  const harness = createHarness({ agents: [{ id: 's1', root: true }] })
   apply(harness.ctx, {
     logFile: '',
     trace: false,
@@ -277,6 +354,14 @@ function decodeTitle(script) {
 
   harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: { kind: 'error' } } })
   check('a failed turn rings', rings.length === 2, `rings=${rings.length}`)
+
+  // A max-token cutoff is the machine deciding to keep working: the answer hit
+  // the output budget and auto-continue opens a fresh turn to finish it. That
+  // truncation's ENDING has no reader, so it must not chime — the chain's real
+  // end is the event worth announcing. (reason.kind === 'max-tokens', finishReason 'length'.)
+  const capped = setup({ config: { minIntervalMs: 0 } })
+  capped.harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: { kind: 'max-tokens' } } })
+  check('a max-token cutoff does not ring', capped.rings.length === 0, `rings=${capped.rings.length}`)
 }
 
 // ---- 11b. turns a machine started are not worth a card -------------------
@@ -287,11 +372,16 @@ function decodeTitle(script) {
   // reader. Each is asserted against an ERRORING turn — the red card that
   // made the exemption worth asking for — so the check cannot pass by simply
   // noticing a quiet `completed`.
+  // NOTE: 'subagent-settled' is deliberately absent. It no longer counts as an
+  // execution trigger: when a subagent hands its result back, the host resumes
+  // the ROOT session to produce the final answer, and that turn is read by the
+  // human waiting on the delegated task. Its own bare-uuid session ending is
+  // still silenced by the isRootAgent/excludeDelegated gate, so excluding it
+  // from this list does not ring for delegated work itself.
   const machineKinds = [
     'goal',
     'agent-message',
     'team-message',
-    'subagent-settled',
     'webhook',
     'schedule',
     'tool-jobs',
@@ -396,9 +486,30 @@ function decodeTitle(script) {
 }
 
 {
+  // REGRESSION (2026-11-13): 'subagent-settled' was removed from
+  // EXECUTION_TRIGGER_KINDS. When a subagent hands its result back, the host
+  // re-posts a user/message on the ROOT session (source.kind =
+  // 'subagent-settled') and the root resumes to produce the final answer. That
+  // turn is read by the human waiting on the delegated task, so its ending must
+  // RING — gating it as an "execution" turn wrongly silenced the completion.
+  // The subagent's own bare-uuid session is still silenced by the
+  // isRootAgent/excludeDelegated gate (tested separately below/above), so this
+  // only restores the ring for the root's resumed, human-readable completion.
+  const root = setup({ agents: [{ id: 'session-9676d526-145c-4373-8a4a-48b6587c4d7d', root: true }], config: { minIntervalMs: 0 } })
+  root.harness.emit('session/event', { id: 'session-9676d526-145c-4373-8a4a-48b6587c4d7d' }, { type: 'user/message', data: { source: { kind: 'subagent-settled' } } })
+  root.harness.emit('session/event', { id: 'session-9676d526-145c-4373-8a4a-48b6587c4d7d' }, { type: 'turn/end', data: { reason: 'completed' } })
+  check(
+    "the root's resumed turn after a subagent settles rings",
+    root.rings.length === 1,
+    `rings=${root.rings.length}`,
+  )
+}
+
+{
   // The machine list itself stays complete: every kind the client labels a
-  // trigger is still silent.
-  for (const kind of ['goal', 'agent-message', 'team-message', 'subagent-settled', 'webhook', 'schedule', 'tool-jobs', 'cordis-host-runner', 'dsh-continue-on-truncate']) {
+  // trigger is still silent. 'subagent-settled' was removed — see the
+  // machineKinds note above — so it is no longer in this list.
+  for (const kind of ['goal', 'agent-message', 'team-message', 'webhook', 'schedule', 'tool-jobs', 'cordis-host-runner', 'dsh-continue-on-truncate']) {
     const { harness, rings } = setup({ config: { minIntervalMs: 0 } })
     harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind } } })
     harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
@@ -438,7 +549,7 @@ function decodeTitle(script) {
   // ...but injection points must still pass through: the harness ships `spawn`
   // through the same object, and dropping it would break every test above.
   const { rings, spawn } = makeRings()
-  const injected = createHarness()
+  const injected = createHarness({ agents: [{ id: 's1', root: true }] })
   apply(injected.ctx, { spawn, logFile: '', trace: false })
   injected.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
   check('an injected key still reaches the plugin', rings.length === 1, `rings=${rings.length}`)
@@ -547,7 +658,7 @@ function decodeTitle(script) {
   /** Apply the plugin with a spawn that keeps the generated scripts. */
   function recorder(config = {}) {
     const scripts = []
-    const harness = createHarness()
+    const harness = createHarness({ agents: [{ id: 'r', root: true }] })
     apply(harness.ctx, {
       ...config,
       logFile: '',
@@ -1800,6 +1911,7 @@ function decodeTitle(script) {
   // A registry that rejects the definition must not take the notifier down with
   // it: the tool is a convenience, the triggers are the product.
   const hostile = createHarness({
+    agents: [{ id: 's1', root: true }],
     tools: {
       register() {
         throw new Error('duplicate tool name')

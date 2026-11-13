@@ -285,6 +285,13 @@ function describeReason(reason) {
  */
 function worthRinging(reason) {
   const kind = typeof reason === 'string' ? reason : reason?.kind
+  // A max-token cutoff is the machine deciding to keep working: the turn was
+  // truncated by the output budget and auto-continue opens a fresh turn to
+  // finish the very same answer. That truncation's ENDING has no reader — the
+  // human is waiting for the completed answer, not for a card announcing it ran
+  // out of room mid-sentence. Silencing it here (regardless of who started the
+  // turn) keeps the chain's real end from being preceded by a pointless chime.
+  if (kind === 'max-tokens') return false
   if (kind !== 'aborted') return true
   const cause = reason?.reason
   const causeKind = typeof cause === 'string' ? cause : cause?.kind
@@ -336,7 +343,15 @@ const EXECUTION_TRIGGER_KINDS = new Set([
   'goal',
   'agent-message',
   'team-message',
-  'subagent-settled',
+  // NOTE: 'subagent-settled' is intentionally NOT an execution trigger. When a
+  // subagent's result is handed back, the host re-posts a user/message on the
+  // ROOT session (source.kind === 'subagent-settled') and the root resumes to
+  // produce the final answer. That turn IS being read by the human -- it is
+  // the main agent finishing the delegated task in front of them. Gating it
+  // as an "execution" turn wrongly silenced the completion the user waited
+  // for. A subagent's OWN session ending is still silenced by the
+  // isRootAgent/excludeDelegated gate (its bare-uuid id gives it away), so
+  // removing the kind here does not start ringing for delegated work itself.
   'webhook',
   'schedule',
   'tool-jobs',
@@ -360,6 +375,34 @@ const EXECUTION_TRIGGER_KINDS = new Set([
 function isExecutionTrigger(kind) {
   if (typeof kind !== 'string' || kind === '') return false
   return EXECUTION_TRIGGER_KINDS.has(kind)
+}
+
+/**
+ * Is this session id the shape of a DELEGATED subagent / background job?
+ *
+ * The host registers a human main conversation under a `session-<uuid>` id.
+ * Delegated work does not: a subagent runs under a bare uuid (`27dd9e09-…`) and
+ * a provider run under a provider-prefixed id (`mnemon-run-v1-…`). Measured over
+ * the plugin's own captured `turn/end` survey, every human conversation that ever
+ * rang carried a `session-` id and every subagent / background job did not --
+ * 43/43 machine turns were bare-uuid / other-prefixed, 0 were `session-`.
+ *
+ * This is the roots-INDEPENDENT half of the gate. `agents.roots()` intermittently
+ * returns undefined in the real host, and a still-registered subagent (one whose
+ * record has not been disposed by the time its turn ends) is a member of `roots()`
+ * anyway, so `roots().includes(agent)` cannot tell it from the human. The id shape
+ * can.
+ *
+ * This is deliberately a BLACKLIST of the delegated shape, not a whitelist of
+ * `session-`: an id this plugin has never seen (a synthetic id, a future host
+ * shape) fails this test and so still RINGS, routed through the roots gate as
+ * before. Silence stays the delegated-work failure mode, never the
+ * missing-a-real-chime one.
+ */
+const DELEGATED_ID_RE = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-z0-9][a-z0-9-]*-run-[a-z0-9-]*)$/i
+
+function isDelegatedSessionId(id) {
+  return typeof id === 'string' && DELEGATED_ID_RE.test(id)
 }
 
 export function apply(ctx, rawConfig) {
@@ -431,30 +474,61 @@ export function apply(ctx, rawConfig) {
     })
   }
 
-  /** Delegated work and background jobs should not ring the human. */
-  function isRootAgent(id) {
+  /**
+   * Delegated work and background jobs should not ring the human.
+   *
+   * `strict` is for low-value, end-of-turn chimes (turn/end). There the safe
+   * default when we cannot positively confirm the agent is the root is to stay
+   * silent: a subagent's / background job's `turn/end` often arrives after the
+   * agent has been disposed, so `agents.get(id)` is `undefined` and guessing
+   * "root" would ring the human for delegated work — the exact noise this gate
+   * exists to suppress.
+   *
+   * Callers that announce something the human must act on (a question, an
+   * approval) keep the non-strict default: there, guessing "root" on an
+   * unresolvable agent errs toward not losing a real prompt.
+   */
+  function isRootAgent(id, { strict = false, excludeDelegated = false } = {}) {
+    // The roots-independent half of the gate (see isDelegatedSessionId): a
+    // still-registered subagent slips past the record checks below because it is
+    // a member of roots(), but its bare-uuid id gives it away.
+    if (excludeDelegated && isDelegatedSessionId(id)) {
+      once(`gate:delegated-id:${id}`, 'gate:delegated-id', { id, strict })
+      return false
+    }
     const agents = ctx.get?.('agents')
     if (!agents || typeof agents.get !== 'function') {
-      once('gate:no-agents-service', 'gate:no-agents-service', { id })
-      return true
+      once('gate:no-agents-service', 'gate:no-agents-service', { id, strict })
+      return !strict
     }
     try {
       const agent = agents.get(id)
       if (agent === undefined) {
-        once(`gate:agent-missing:${id}`, 'gate:agent-missing', { id })
-        return true
+        once(`gate:agent-missing:${id}`, 'gate:agent-missing', { id, strict })
+        // A settled subagent / background job whose agent record is already
+        // gone. Never a reason to ring on its own; only a strict caller treats
+        // this as "not root". Non-strict callers (question/approval) still ring.
+        return !strict
       }
       const roots = agents.roots?.()
       if (!Array.isArray(roots)) {
-        once('gate:no-roots', 'gate:no-roots', { id, rootsType: typeof roots })
+        once('gate:no-roots', 'gate:no-roots', { id, rootsType: typeof roots, strict })
+        // The agent record is STILL REGISTERED here (we got past the
+        // `agent === undefined` branch above) -- only the roots enumeration is
+        // unavailable. In the real host `roots()` intermittently returns
+        // undefined even for a live human conversation, so treating "no roots"
+        // as "not root" would silence the very chime a human is waiting on.
+        // Fall through to ring, exactly as the pre-strict gate did: the noise
+        // we actually care about (a settled subagent / background job) is
+        // caught by the `agent-missing` branch, not this one.
         return true
       }
       const isRoot = roots.includes(agent)
-      once(`gate:isRoot:${id}:${isRoot}`, 'gate:isRoot', { id, isRoot, rootCount: roots.length })
+      once(`gate:isRoot:${id}:${isRoot}`, 'gate:isRoot', { id, isRoot, rootCount: roots.length, strict })
       return isRoot
     } catch (error) {
-      once(`gate:isRoot-threw:${id}`, 'gate:isRoot-threw', { id, error: String(error) })
-      return true
+      once(`gate:isRoot-threw:${id}`, 'gate:isRoot-threw', { id, error: String(error), strict })
+      return !strict
     }
   }
 
@@ -1085,7 +1159,13 @@ export function apply(ctx, rawConfig) {
 
     const summary = lastAssistant.get(session.id) ?? ''
     const trigger = triggerKinds.get(session.id)
-    if (cfg.notifyOnTurnEnd && isRootAgent(session.id) && worthRinging(data.reason)) {
+    // strict: a turn/end chime is low-value. If the agent record is gone
+    // (settled subagent / background job) or otherwise unresolvable, stay
+    // silent rather than guess "root" and ring the human for delegated work.
+    // excludeDelegated adds the roots-independent half: a subagent whose record
+    // is STILL registered (not yet disposed) is a member of roots() and would
+    // slip past the record checks, but its bare-uuid id gives it away.
+    if (cfg.notifyOnTurnEnd && isRootAgent(session.id, { strict: true, excludeDelegated: true }) && worthRinging(data.reason)) {
       if (cfg.exemptExecutionTurns && isExecutionTrigger(trigger)) {
         // A machine started this turn, so a card about how it ended has no
         // reader. Counted once per session-trigger pair: the exemption is
