@@ -24,6 +24,15 @@
         # there would silence the notifier on exactly the turns it exists to
         # announce. Set false to ring on every ending again.
         exemptExecutionTurns: true
+        # A root turn that ended only because it DELEGATED work is not "done"
+        # either — the human is still waiting on that subagent. While any
+        # subagent under this session is still running (seen live via
+        # `subagent/start`/`subagent/end`, or read off the host registry as a
+        # running descendant), the turn-end card is held back. The collecting
+        # turn when a subagent's result comes back still rings: that subagent
+        # has ended, so nothing is pending. Set false to ring on every
+        # confirmed-root ending even mid-delegation.
+        waitPendingDelegates: true
         includeSummary: true
         askGuidance: true
         # Registers the `attention_popup` tool: one call fires one card right

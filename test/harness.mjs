@@ -119,6 +119,11 @@ export function createHarness({ agents = [], webServer = 'default', connection =
         return {
           get: (id) => agents.find((agent) => agent.id === id),
           roots: () => agents.filter((agent) => agent.root !== false),
+          // Every live agent, in registration order -- the shape the real host's
+          // AgentRegistry.list() returns. The pending-delegate gate scans this to
+          // find subagents still in `running` status (a thin agent stub without a
+          // `status` is simply skipped, so older tests are unaffected).
+          list: () => agents,
           // The second source of "which conversation is this": the agent that
           // started the current turn. Modelled here because the plugin reads it
           // as a fallback when a tool runs without `exec.agent` on it.

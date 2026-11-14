@@ -98,6 +98,13 @@ const DEFAULTS = {
   // event never arrived, or the host does not send one) the plugin keeps its
   // old behaviour and rings.
   exemptExecutionTurns: true,
+  // A delegated subagent that is STILL RUNNING is not "done" either. When the
+  // root turn ends only because it dispatched work and yielded — the human is
+  // still waiting on that work — the "task finished" card would be just as
+  // premature as the machine-trigger one above. Hold the card while any
+  // subagent under this session is still running. Off restores the old
+  // behaviour: every confirmed-root turn/end rings, even mid-delegation.
+  waitPendingDelegates: true,
   includeSummary: true,
   askGuidance: true,
   // Register the `attention_popup` tool: one call fires one card, so delivery
@@ -421,6 +428,23 @@ export function apply(ctx, rawConfig) {
   const triggerKinds = new Map()
   const lastNotified = new Map()
   const pending = new Map()
+  // PENDING DELEGATES. Which subagents are still running under each session,
+  // so a root turn/end that merely dispatched work can be held back.
+  //
+  // Two structures, fed by the host's `subagent/start` / `subagent/end`
+  // lifecycle events (each carries `{ id, parentSessionId, local, ... }` where
+  // `id` is the child session and `parentSessionId` its DIRECT parent):
+  //
+  //   delegation  childId -> direct parentId, for climbing a nested chain up
+  //               to the root that is waiting on it.
+  //   live        the set of childIds that started and have not ended.
+  //
+  // The events are emitted on the parent agent's scope carrier, but a listener
+  // whose own ctx carries no scope tag receives every one of them (the carrier
+  // filter returns true for an untagged ctx), so a plain `ctx.on` here sees the
+  // whole tree.
+  const delegation = new Map()
+  const liveSubagents = new Set()
   // STACKING ORDINAL. How many cards are on screen right now, handed to each new
   // card so it can retreat up and to the left of the ones in front of it.
   //
@@ -536,6 +560,87 @@ export function apply(ctx, rawConfig) {
       once(`gate:isRoot-threw:${id}`, 'gate:isRoot-threw', { id, error: String(error), strict })
       return !strict
     }
+  }
+
+  /**
+   * Climb the recorded delegation chain from a child up to its ancestors.
+   *
+   * `delegation` maps each started subagent to its DIRECT parent only, so a
+   * nested sub-subagent is linked to its parent, not to the root. Walking the
+   * parent links from any running child yields every session that is waiting
+   * on it — including the root. The `seen` guard makes a malformed cycle
+   * terminate rather than spin.
+   */
+  function ancestorsOfSession(childId) {
+    const chain = []
+    const seen = new Set()
+    let cursor = delegation.get(childId)
+    while (typeof cursor === 'string' && cursor !== '' && !seen.has(cursor)) {
+      seen.add(cursor)
+      chain.push(cursor)
+      cursor = delegation.get(cursor)
+    }
+    return chain
+  }
+
+  /**
+   * True when `sessionId` still has delegated subagents running.
+   *
+   * This is the gate that holds the "task finished" card while the root has
+   * only just dispatched work. Two independent signals, either of which is
+   * enough — they cover each other's blind spots:
+   *
+   *   1. The live-set: subagents whose `subagent/start` we saw and whose
+   *      `subagent/end` has not arrived. Self-contained, but blind to anything
+   *      that started before the plugin loaded or whose events were missed.
+   *   2. The host's own registry: `agents.list()` filtered to agents still in
+   *      `running` status whose ancestor chain (read off each agent's session
+   *      header: `origin === 'subagent'` + `parentSession`) includes this
+   *      session. This is the same running-descendants read the host's own
+   *      archive admission uses, so it is authoritative — but it needs
+   *      `agent.session.header`, which the real host has and a thin test
+   *      double may not.
+   *
+   * A settled-and-resumed root turn (the host reopens the root to collect a
+   * finished subagent's result) correctly reads as NOT pending: that subagent
+   * has ended, so the card for the collecting turn is allowed through. Only
+   * work that is genuinely still in flight holds the card.
+   *
+   * Default-open on any uncertainty: if the registry cannot be read and the
+   * live-set is empty, this returns false and the turn rings, exactly as it
+   * did before this gate existed. A notifier must not learn to swallow real
+   * endings it cannot classify.
+   */
+  function hasPendingDelegates(sessionId) {
+    if (sessionId === undefined || sessionId === null || sessionId === '') return false
+    for (const child of liveSubagents) {
+      if (child === sessionId || ancestorsOfSession(child).includes(sessionId)) return true
+    }
+    try {
+      const agents = ctx.get?.('agents')
+      const list = typeof agents?.list === 'function' ? agents.list() : null
+      if (!Array.isArray(list)) return false
+      for (const agent of list) {
+        if (agent?.status !== 'running') continue
+        // Walk this agent's session header up through its subagent parents.
+        const chain = []
+        const seen = new Set([agent.id])
+        let header = agent?.session?.header
+        while (header?.origin === 'subagent' && header?.parentSession !== undefined && !seen.has(header.parentSession)) {
+          const parentId = header.parentSession
+          chain.push(parentId)
+          seen.add(parentId)
+          header = agents.get?.(parentId)?.session?.header
+        }
+        if (chain.includes(sessionId)) return true
+      }
+    } catch (error) {
+      // A registry that throws must not silence the card: fall through to
+      // ring, the pre-gate behaviour.
+      once('hasPendingDelegates-threw', 'hasPendingDelegates-threw', { sessionId, error: String(error) })
+      return false
+    }
+    return false
   }
 
   /**
@@ -1182,6 +1287,16 @@ export function apply(ctx, rawConfig) {
           sessionId: session.id,
           trigger,
         })
+      } else if (cfg.waitPendingDelegates && hasPendingDelegates(session.id)) {
+        // This turn ended only because the agent dispatched delegated work and
+        // yielded — a subagent under it is STILL RUNNING, so nothing is
+        // finished and the human still waiting on that work has nothing to
+        // read yet. Hold the card. Counted once per session so a long wait
+        // cannot flood the log, but re-armed if the pending set changes.
+        once(`wait:pending-delegates:${session.id}`, 'suppressed:pending-delegates', {
+          sessionId: session.id,
+          live: [...liveSubagents],
+        })
       } else {
         const reason = describeReason(data.reason)
         const key = `turn:${session.id}`
@@ -1202,6 +1317,39 @@ export function apply(ctx, rawConfig) {
     cancelPending(`approval:${session.id}`)
   })
 
+  // ---- the delegation seam ---------------------------------------------
+  //
+  // The host emits `subagent/start` when a delegated subagent begins and
+  // `subagent/end` when it settles. Each event carries `{ id, parentSessionId,
+  // local, ... }`: `id` is the child session, `parentSessionId` its DIRECT
+  // parent. We record the parent link for the whole chain (so a nested
+  // sub-subagent still resolves up to the waiting root) and track the live set
+  // that `hasPendingDelegates` reads.
+  //
+  // These feed only the pending-delegate gate. A subagent's own `turn/end` is
+  // already silenced by the isRootAgent/excludeDelegated gate, and its result
+  // still reaches the human through the settlement turn (the host reopens the
+  // root with a `subagent-settled` message, which is deliberately NOT an
+  // execution trigger). Nothing here changes either of those paths.
+
+  ctx.on('subagent/start', (info) => {
+    reached('subagent/start', info)
+    const childId = info?.id
+    if (typeof childId !== 'string' || childId === '') return
+    const parentId = info?.parentSessionId
+    if (typeof parentId === 'string' && parentId !== '') delegation.set(childId, parentId)
+    liveSubagents.add(childId)
+  })
+
+  ctx.on('subagent/end', (info) => {
+    reached('subagent/end', info)
+    const childId = info?.id
+    if (typeof childId !== 'string' || childId === '') return
+    liveSubagents.delete(childId)
+    // Keep the parent link: a still-live sibling may need it to climb to the
+    // root, and a later event for this child (a duplicate end) is harmless.
+  })
+
   ctx.on('agent/disposed', (payload) => {
     reached('agent/disposed', payload)
     const agent = payload?.agent
@@ -1210,6 +1358,9 @@ export function apply(ctx, rawConfig) {
     triggerKinds.delete(agent.id)
     cancelPending(`question:${agent.id}`)
     cancelPending(`approval:${agent.id}`)
+    // If a subagent was disposed without a clean `subagent/end`, drop it from
+    // the live set so its root's next turn/end is not held forever.
+    liveSubagents.delete(agent.id)
   })
 
   ctx.effect(() => () => {

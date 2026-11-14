@@ -285,6 +285,90 @@ function decodeTitle(script) {
   )
 }
 
+// ---- 7e. a root with a subagent STILL RUNNING is not "done" yet -----------
+//
+// The 2026-11-14 report: the root dispatched two research subagents, its turn
+// ended because it had dispatched and yielded, and the plugin fired "任务结束"
+// while the human was still waiting on that work. A root whose delegated work is
+// in flight has nothing finished to announce. Two independent signals hold the
+// card: the event-driven live set (subagent/start without a matching end) and
+// the host's own registry (agents.list() with a running descendant). Either is
+// enough; both are covered here.
+{
+  // Signal 1, the live set: subagent/start seen, no end yet.
+  const root = 'session-9676d526-145c-4373-8a4a-48b6587c4d7d'
+  const child = '27dd9e09-9b8c-40d9-9abe-f13d7294df89'
+  const { harness, rings } = setup({ agents: [{ id: root, root: true }], config: { minIntervalMs: 0 } })
+  harness.emit('subagent/start', { id: child, parentSessionId: root, local: true })
+  // The root's turn ends only because it dispatched and yielded. A human opened
+  // the turn (kind 'user'), so it is not an execution trigger either -- the only
+  // reason it stays quiet is the pending delegate.
+  harness.emit('session/event', { id: root }, { type: 'user/message', data: { source: { kind: 'user' } } })
+  harness.emit('session/event', { id: root }, { type: 'turn/end', data: { reason: 'completed' } })
+  check('a root turn/end while its subagent still runs does not ring', rings.length === 0, `rings=${rings.length}`)
+
+  // The subagent settles and its end arrives; the next root turn rings again.
+  harness.emit('subagent/end', { id: child, parentSessionId: root, local: true, stopReason: 'completed' })
+  harness.emit('session/event', { id: root }, { type: 'turn/end', data: { reason: 'completed' } })
+  check('after the subagent ends, the root rings again', rings.length === 1, `rings=${rings.length}`)
+}
+
+{
+  // Signal 2, the registry: no start event was ever seen (it predates the
+  // plugin, or its event was missed), but agents.list() still reports the
+  // subagent RUNNING with a session-header chain back to the root. This is the
+  // host's own running-descendants read, so it catches what the live set cannot.
+  const root = 'session-11111111-1111-4111-8111-111111111111'
+  const child = '27dd9e09-9b8c-40d9-9abe-f13d7294df89'
+  const { harness, rings } = setup({
+    agents: [
+      { id: root, root: true },
+      { id: child, status: 'running', session: { header: { origin: 'subagent', parentSession: root } } },
+    ],
+    config: { minIntervalMs: 0 },
+  })
+  harness.emit('session/event', { id: root }, { type: 'turn/end', data: { reason: 'completed' } })
+  check('a running registry subagent holds the root card without a start event', rings.length === 0, `rings=${rings.length}`)
+
+  // Once that subagent is no longer running, the root card goes through.
+  const idle = setup({
+    agents: [
+      { id: root, root: true },
+      { id: child, status: 'idle', session: { header: { origin: 'subagent', parentSession: root } } },
+    ],
+    config: { minIntervalMs: 0 },
+  })
+  idle.harness.emit('session/event', { id: root }, { type: 'turn/end', data: { reason: 'completed' } })
+  check('an idle registry subagent does not hold the root card', idle.rings.length === 1, `rings=${idle.rings.length}`)
+}
+
+{
+  // A NESTED subagent (a sub-subagent) still counts. The mid delegate has
+  // already ended, but its own child is still running, and the recorded
+  // parent-link chain (leaf -> mid -> root) resolves up to the waiting root.
+  const root = 'session-33333333-3333-4333-8333-333333333333'
+  const mid = 'aaaaaaaa-1111-4111-8111-111111111111'
+  const leaf = 'bbbbbbbb-2222-4222-8222-222222222222'
+  const { harness, rings } = setup({ agents: [{ id: root, root: true }], config: { minIntervalMs: 0 } })
+  harness.emit('subagent/start', { id: mid, parentSessionId: root, local: true })
+  harness.emit('subagent/start', { id: leaf, parentSessionId: mid, local: true })
+  harness.emit('subagent/end', { id: mid, parentSessionId: root, local: true })
+  harness.emit('session/event', { id: root }, { type: 'turn/end', data: { reason: 'completed' } })
+  check('a nested grandchild still running holds the root card', rings.length === 0, `rings=${rings.length}`)
+}
+
+{
+  // The gate is a switch: turning it off restores the old behaviour, where a
+  // confirmed-root turn rings even mid-delegation.
+  const root = 'session-22222222-2222-4222-8222-222222222222'
+  const child = '27dd9e09-9b8c-40d9-9abe-f13d7294df89'
+  const { harness, rings } = setup({ agents: [{ id: root, root: true }], config: { minIntervalMs: 0, waitPendingDelegates: false } })
+  harness.emit('subagent/start', { id: child, parentSessionId: root, local: true })
+  harness.emit('session/event', { id: root }, { type: 'user/message', data: { source: { kind: 'user' } } })
+  harness.emit('session/event', { id: root }, { type: 'turn/end', data: { reason: 'completed' } })
+  check('waitPendingDelegates:false rings even while a subagent runs', rings.length === 1, `rings=${rings.length}`)
+}
+
 // ---- 8. every switch can be turned off ----------------------------------
 
 {
@@ -378,6 +462,14 @@ function decodeTitle(script) {
   // human waiting on the delegated task. Its own bare-uuid session ending is
   // still silenced by the isRootAgent/excludeDelegated gate, so excluding it
   // from this list does not ring for delegated work itself.
+  //
+  // NOTE: 'dsh-continue-on-truncate' is deliberately absent too. It opens a
+  // FRESH turn to finish an answer that hit the output-token limit, and a long
+  // answer can chain several. Each INTERMEDIATE segment ends in
+  // reason.kind === 'max-tokens', which worthRinging() already silences; the
+  // FINAL segment ends in a real reason (completed/error) and is the answer the
+  // human has been waiting on, so it must ring. Listing it here would mute that
+  // final card — tested positively below.
   const machineKinds = [
     'goal',
     'agent-message',
@@ -386,13 +478,27 @@ function decodeTitle(script) {
     'schedule',
     'tool-jobs',
     'cordis-host-runner',
-    'dsh-continue-on-truncate',
   ]
   for (const kind of machineKinds) {
     const { harness, rings } = setup({ config: { minIntervalMs: 0 } })
     harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind } } })
     harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: { kind: 'error' } } })
     check(`a ${kind}-triggered turn does not ring`, rings.length === 0, `rings=${rings.length}`)
+  }
+
+  // 'dsh-continue-on-truncate' finishes an answer the human is waiting on, so
+  // its FINAL segment rings even though it is machine-started. (Its
+  // INTERMEDIATE segments end in max-tokens and are silenced by worthRinging,
+  // covered by the endings tests.) It is deliberately not an execution trigger.
+  {
+    const { harness, rings } = setup({ config: { minIntervalMs: 0 } })
+    harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind: 'dsh-continue-on-truncate' } } })
+    harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
+    check(
+      'a dsh-continue-on-truncate final segment rings',
+      rings.length === 1,
+      `rings=${rings.length}`,
+    )
   }
 }
 
@@ -447,8 +553,11 @@ function decodeTitle(script) {
   // turn, not the last one that arrived. A human reply injected mid-turn used
   // to overwrite the machine trigger and announce a turn nobody watched --
   // the auto-continue case, where the human is waiting for their own answer.
+  // The opening kind is `schedule`, an execution trigger, so a ring here would
+  // mean the exemption was lost too; a kind that is NOT an execution trigger
+  // (e.g. dsh-continue-on-truncate) would ring regardless and prove nothing.
   const { harness, rings } = setup({ config: { minIntervalMs: 0 } })
-  harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind: 'dsh-continue-on-truncate' } } })
+  harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind: 'schedule' } } })
   harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind: 'user' } } })
   harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
   check(
@@ -509,7 +618,10 @@ function decodeTitle(script) {
   // The machine list itself stays complete: every kind the client labels a
   // trigger is still silent. 'subagent-settled' was removed — see the
   // machineKinds note above — so it is no longer in this list.
-  for (const kind of ['goal', 'agent-message', 'team-message', 'webhook', 'schedule', 'tool-jobs', 'cordis-host-runner', 'dsh-continue-on-truncate']) {
+  // 'dsh-continue-on-truncate' is likewise absent: it is not an execution
+  // trigger (see the machineKinds note), so it RINGS and is tested positively
+  // there rather than here.
+  for (const kind of ['goal', 'agent-message', 'team-message', 'webhook', 'schedule', 'tool-jobs', 'cordis-host-runner']) {
     const { harness, rings } = setup({ config: { minIntervalMs: 0 } })
     harness.emit('session/event', { id: 's1' }, { type: 'user/message', data: { source: { kind } } })
     harness.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: 'completed' } })
