@@ -105,6 +105,19 @@ const DEFAULTS = {
   // subagent under this session is still running. Off restores the old
   // behaviour: every confirmed-root turn/end rings, even mid-delegation.
   waitPendingDelegates: true,
+  // Memory distillation and other background maintenance run in STANDALONE
+  // sessions that are never shown in the conversation (the Mnemon plugin
+  // archives them on purpose so they do not appear in the Subagent list). They
+  // are seeded with a synthetic `user` message and their turn ends `completed`,
+  // so they look exactly like a real root turn — but there is no human reading
+  // that session. Silence any turn whose RESOLVED SESSION TITLE starts with one
+  // of these prefixes. The Mnemon task agents all rename their session to
+  // "Mnemon · …" (Idle review, Memory maintenance, Save to memory, Skills,
+  // Document, Ask Agent, …), so one prefix covers the whole family. Empty list
+  // restores the old behaviour. This is a blacklist of visible task names, not
+  // a whitelist of triggers: a session the user personally named to match is
+  // silenced too, which is the acceptable cost of catching the hidden ones.
+  silentTitlePrefixes: ['Mnemon · '],
   includeSummary: true,
   askGuidance: true,
   // Register the `attention_popup` tool: one call fires one card, so delivery
@@ -684,6 +697,35 @@ export function apply(ctx, rawConfig) {
       }
     } catch (error) {
       once('resolveSessionName-threw', 'resolveSessionName-threw', { sessionId, error: String(error) })
+    }
+    return ''
+  }
+
+  /**
+   * True when this session is a hidden background task that no human is
+   * reading. The Mnemon plugin runs memory distillation and other maintenance
+   * in standalone sessions it archives on purpose — they never appear in the
+   * Subagent list, emit no `subagent/start`, and drop the `origin:"subagent"`
+   * marker in modern mode, so the delegated-id and pending-delegate gates never
+   * see them. What they DO carry is a task title ("Mnemon · Idle review",
+   * "Mnemon · Memory maintenance", …), and that title is exactly what this
+   * plugin would print on the card. So the title is the honest signal: if the
+   * headline we are about to raise names a background task family, the card has
+   * no reader and should stay silent.
+   *
+   * Prefixes come from config (`silentTitlePrefixes`); an empty list disables
+   * the check entirely.
+   *
+   * @param {string|undefined} sessionId
+   * @returns {string} the matching prefix, or '' when this is not a silent task.
+   */
+  function silentTitleMatch(sessionId) {
+    const prefixes = Array.isArray(cfg.silentTitlePrefixes) ? cfg.silentTitlePrefixes : []
+    if (prefixes.length === 0) return ''
+    const name = resolveSessionName(sessionId)
+    if (name === '') return ''
+    for (const prefix of prefixes) {
+      if (typeof prefix === 'string' && prefix !== '' && name.startsWith(prefix)) return prefix
     }
     return ''
   }
@@ -1298,16 +1340,32 @@ export function apply(ctx, rawConfig) {
           live: [...liveSubagents],
         })
       } else {
-        const reason = describeReason(data.reason)
-        const key = `turn:${session.id}`
-        if (shouldNotify(key)) {
-          const detail = cfg.includeSummary && summary !== '' ? clip(summary, 180) : ''
-          notify(
-            cfg.title,
-            detail === '' ? `任务结束：${reason}` : `任务结束（${reason}）：${detail}`,
-            toneOfEnding(data.reason),
-            session.id,
-          )
+        const silent = silentTitleMatch(session.id)
+        if (silent !== '') {
+          // A hidden background task session (memory distillation, maintenance)
+          // finished. It was seeded with a synthetic user message and its turn
+          // ends `completed`, so it reaches this seam looking exactly like a
+          // real root turn — but the session is archived and never shown, so
+          // the card would address nobody. The task title we would have printed
+          // is the giveaway. Counted once per session+title so a repeat task
+          // still leaves one trace line.
+          once(`silent:background-task:${session.id}`, 'suppressed:background-task', {
+            sessionId: session.id,
+            title: resolveSessionName(session.id),
+            prefix: silent,
+          })
+        } else {
+          const reason = describeReason(data.reason)
+          const key = `turn:${session.id}`
+          if (shouldNotify(key)) {
+            const detail = cfg.includeSummary && summary !== '' ? clip(summary, 180) : ''
+            notify(
+              cfg.title,
+              detail === '' ? `任务结束：${reason}` : `任务结束（${reason}）：${detail}`,
+              toneOfEnding(data.reason),
+              session.id,
+            )
+          }
         }
       }
     }

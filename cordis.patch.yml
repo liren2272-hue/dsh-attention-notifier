@@ -56,8 +56,8 @@
         focusProcess: 'DeepSeek Harness'
         # Where the raiser writes which window it chose and how it woke it.
         # Raising fails silently, so this is the only evidence separating
-        # "found nothing to raise" from "the window was already up". '' off.
-        raiseLog: 'C:\\Users\\15940\\AppData\\Local\\Temp\\dsh-attention\\raise.log'
+        # "found nothing to raise" from "the window was already up".
+        # 不覆盖 raiseLog → 源码默认 os.tmpdir()/dsh-attention/raise.log（随机器而变）。
         # And name the session: the click hands a one-shot token to the host
         # and the page opens the exact session that interrupted you. Set false
         # for raise-the-window-only.
