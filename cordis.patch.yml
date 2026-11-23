@@ -41,11 +41,13 @@
         # triggers are unaffected.
         quickPopup: true
         # Pacing. minIntervalMs collapses bursts (a tool that asks three times
-        # in a row rings once); remindEveryMs/maxReminders re-nag an
-        # unanswered question, then stop.
+        # in a row rings once). Yellow/ask cards no longer re-nag by default:
+        # the second popup was unwanted. remindOnAsk:true restores the old
+        # cadence, governed by remindEveryMs/maxReminders.
         minIntervalMs: 4000
         remindEveryMs: 120000
         maxReminders: 3
+        remindOnAsk: false
         # Clicking a card raises this process's window, so "go deal with it" is
         # one click. Matched as a process name, not a window title. The raiser
         # enumerates that process's windows itself: a window the app hid when

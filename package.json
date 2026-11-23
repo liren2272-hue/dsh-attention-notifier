@@ -1,6 +1,6 @@
 {
   "name": "@liren2272/dsh-attention",
-  "version": "1.8.3",
+  "version": "1.8.5",
   "icon": "./icon.svg",
   "private": true,
   "type": "module",

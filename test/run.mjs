@@ -143,7 +143,7 @@ function decodeTitle(script) {
 // ---- 4. a question rings, then nudges up to the cap ----------------------
 
 {
-  const { harness, rings } = setup({ config: { remindEveryMs: 120_000, maxReminders: 2 } })
+  const { harness, rings } = setup({ config: { remindOnAsk: true, remindEveryMs: 120_000, maxReminders: 2 } })
   const answer = harness.waterfall('user-questions/request', {
     questions: [{ id: 'q1', question: '导出为 PDF 还是 Markdown？' }],
     agent: { id: 's1' },
@@ -166,10 +166,67 @@ function decodeTitle(script) {
   check('the answerer chain still receives the human answer', settled?.answers?.[0]?.selected?.[0] === 'PDF')
 }
 
+// ---- 4b. a yellow card never re-pops by default -------------------------
+{
+  const { harness, rings } = setup({ config: { remindEveryMs: 1_000, maxReminders: 5 } })
+  const answer = harness.waterfall('user-questions/request', {
+    questions: [{ id: 'q1', question: '黄色卡片会弹第二次吗？' }],
+    agent: { id: 's1' },
+  })
+  check('the ask card rings exactly once', rings.length === 1, `rings=${rings.length}`)
+  check('no nudge timer is armed for an ask card', harness.businessTimers().length === 0, `live=${harness.businessTimers().length}`)
+  clock += 120_000
+  check('the yellow card does not re-pop later', rings.length === 1, `rings=${rings.length}`)
+  harness.settleNext({ answers: [{ id: 'q1', selected: ['是'] }] })
+  await answer
+}
+
+// ---- 4c. an approval (also yellow) never re-pops by default --------------
+{
+  const { harness, rings } = setup({ config: { remindEveryMs: 1_000, maxReminders: 5 } })
+  const answer = harness.waterfall('approval/request', { agent: { id: 's1' }, toolName: 'pwsh' })
+  check('the approval card rings once', rings.length === 1, `rings=${rings.length}`)
+  check('no nudge timer is armed for an approval', harness.businessTimers().length === 0, `live=${harness.businessTimers().length}`)
+  clock += 120_000
+  check('the yellow approval does not re-pop later', rings.length === 1, `rings=${rings.length}`)
+  harness.settleNext({ answers: [{ id: 'a1', selected: ['yes'] }] })
+  await answer
+}
+
+// ---- 4d. the top-right X closes quietly, the rest of the card jumps ------
+{
+  const script = buildScript({ popup: true, sound: false, balloon: false, box: false }, 't', 'b')
+  check('the card defines a shared close-box hit region',
+    /\$xS=\[int\]\(22\*\$k\)/.test(script) && /\$xL=\$w-\$xM-\$xS/.test(script) && /\$xT=\$padTop/.test(script))
+  check('the X is painted with two crossing strokes',
+    (script.match(/\$gr\.DrawLine\(\$xpen/g) ?? []).length === 2)
+  check('the chip is shifted left to make room for the X', /\$cx=\(\$xL-\[int\]\(8\*\$k\)\)-\$cw/.test(script))
+  check('a single XHit predicate drives both paint and mouse hit testing',
+    /function XHit\(\[int\]\$px,\[int\]\$py\)/.test(script) &&
+      (script.match(/XHit \$mp\[0\] \$mp\[1\]/g) ?? []).length >= 3)
+  check('hover swaps the cursor to a hand and repaints',
+    script.includes('$f.Cursor=if($over){[System.Windows.Forms.Cursors]::Hand}') &&
+      script.includes('if($over -ne $script:xHover){ $script:xHover=$over; $f.Invalidate() }'))
+  check('mouse-down paints a pressed state, mouse-up performs the quiet close',
+    script.includes('if(XHit $mp[0] $mp[1]){ $script:xDown=$true') &&
+      script.includes('if(XHit $mp[0] $mp[1]){ $script:xHover=$false; $f.Close(); return }'))
+  check('mouse-leave clears hover and pressed state',
+    script.includes('$f.Add_MouseLeave({') && script.includes('$script:xHover=$false; $script:xDown=$false'))
+  check('the X paint uses distinct idle / hover / pressed branches',
+    script.includes('if($script:xDown){') && script.includes('} elseif($script:xHover){'))
+  const quiet = script.indexOf('$f.Close(); return')
+  const jump = script.indexOf('Send-Jump; FocusDsh; $f.Close()', quiet)
+  check('the quiet close still precedes any jump or focus',
+    quiet > 0 && jump > quiet,
+    `quiet=${quiet} jump=${jump}`)
+  check('the non-X click still jumps and focuses',
+    (script.match(/Send-Jump; FocusDsh; \$f\.Close\(\)/g) ?? []).length === 1)
+}
+
 // ---- 5. answering cancels the pending nudge ------------------------------
 
 {
-  const { harness, rings } = setup({ config: { remindEveryMs: 120_000, maxReminders: 3 } })
+  const { harness, rings } = setup({ config: { remindOnAsk: true, remindEveryMs: 120_000, maxReminders: 3 } })
   const answer = harness.waterfall('user-questions/request', {
     questions: [{ id: 'q', question: '继续吗？' }],
     agent: { id: 's1' },
@@ -818,6 +875,7 @@ function decodeTitle(script) {
     const scripts = []
     const harness = createHarness()
     apply(harness.ctx, {
+      remindOnAsk: true,
       remindEveryMs: 60_000,
       maxReminders: 1,
       logFile: '',
@@ -933,8 +991,8 @@ function decodeTitle(script) {
       Number(/padR=\[int\]\((\d+)\*\$k\)/.exec(script)?.[1] ?? 0) >
         Number(/padX=\[int\]\((\d+)\*\$k\)/.exec(script)?.[1] ?? 0),
   )
-  check('the status chip hangs off the text column’s right edge, not the card’s',
-    script.includes('$cx=$w-$padR-$cw'))
+  check('the status chip is anchored left of the close box, not the card edge',
+    script.includes('$cx=($xL-[int](8*$k))-$cw'))
   // The chip's internal spacing. The old formula (`tw+18`) left ONE pixel between
   // the text and the right edge — 17 of those 18px was spent positioning the text
   // after the dot — so a four-character status sat hard against the border. The

@@ -128,6 +128,10 @@ const DEFAULTS = {
   minIntervalMs: 4_000,
   remindEveryMs: 120_000,
   maxReminders: 3,
+  // Yellow (ask) cards stay on screen until the human answers. Re-firing
+  // the same orange card was the "弹第二次" complaint, so nudge is off
+  // for ask by default; set true to restore the old behaviour.
+  remindOnAsk: false,
   soundFile: 'C:\\Windows\\Media\\notify.wav',
   // Fallback headline: used only when the conversation has no name yet (a
   // brand-new session before its first `session/title` event). The headline
@@ -1052,6 +1056,11 @@ export function apply(ctx, rawConfig) {
    */
   function trackPending(key, body, tone, sessionId) {
     cancelPending(key)
+    // An unanswered ASK card is already visible and waiting for a human.
+    // A second orange popup a few minutes later repeats the same request,
+    // covers the first card and was reported as unwanted ("不用弹第二次").
+    // Off by default; the old cadence is still available via remindOnAsk.
+    if (tone === 'ask' && cfg.remindOnAsk !== true) return
     let remaining = Math.max(0, Math.floor(cfg.maxReminders))
     if (remaining === 0 || !(cfg.remindEveryMs > 0)) return
     const state = { timers: [] }

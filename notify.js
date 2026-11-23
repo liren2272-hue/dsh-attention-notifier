@@ -908,6 +908,20 @@ export function buildScript(cfg, title, body, tone = 'ok') {
     lines.push('$brandH=[int][Math]::Ceiling($sf.GetHeight($gfx))')
     lines.push('$chipH=[int](24*$k)')
     lines.push('$eyebrowH=[Math]::Max($brandH,$chipH)')
+    // Close box at the extreme top-right. All hit-test and paint code share
+    // these three vars so the drawn X and the clickable region cannot drift.
+    lines.push('$xS=[int](22*$k)')
+    lines.push('$xM=[int](9*$k)')
+    lines.push('$xL=$w-$xM-$xS')
+    lines.push('$xT=$padTop+[int](($eyebrowH-$xS)/2)')
+    // Three visual states for the close box: idle, hover (pointer over it) and
+    // pressed (left button down on it). Paint reads these; the MouseMove /
+    // MouseDown / MouseUp handlers below maintain them. Keeping the hit test in
+    // one PowerShell function means the painted box and the interactive region
+    // can never drift apart.
+    lines.push('$script:xHover=$false; $script:xDown=$false')
+    lines.push('function XHit([int]$px,[int]$py){ return ($px -ge $xL -and $px -le ($xL+$xS) -and $py -ge $xT -and $py -le ($xT+$xS)) }')
+    lines.push('function XPoint(){ $p=$f.PointToClient([System.Windows.Forms.Control]::MousePosition); return @($p.X,$p.Y) }')
     lines.push('$headY=$padTop+$eyebrowH+[int](5*$k)')
     lines.push('$bodyY=$headY+$headH+[int](5*$k)')
     // TWO different strings live on the top row and the headline row, and they
@@ -1119,11 +1133,11 @@ export function buildScript(cfg, title, body, tone = 'ok') {
     //
     // which is `dot(6) + 6 + text + 10` from the left edge, i.e. the text starts
     // at 22 and the chip is `tw + 32` wide. The right edge stays pinned to
-    // $w-$padR, so it remains flush with the text column and the countdown
-    // hairline.
+    // close box, leaving the X clear at the corner while the chip stays
+    // aligned with the text column and the countdown hairline.
     lines.push('  $tw=$gr.MeasureString($script:statusText,$cf).Width')
     lines.push('  $cw=$tw+[int](32*$k)')
-    lines.push('  $cx=$w-$padR-$cw')
+    lines.push('  $cx=($xL-[int](8*$k))-$cw')
     lines.push('  $cy=$padTop+($eyebrowH-$chipH)/2')
     // eyebrow: the PRODUCT label, never the headline.
     //
@@ -1148,6 +1162,28 @@ export function buildScript(cfg, title, body, tone = 'ok') {
     lines.push('  $gr.FillEllipse($gb,($cx+[int](10*$k)),($cy+$chipH/2-$db/2),$db,$db)')
     lines.push('  $ctb=New-Object System.Drawing.SolidBrush($script:tintText)')
     lines.push('  $gr.DrawString($script:statusText,$cf,$ctb,($cx+[int](22*$k)),($cy+($chipH-$gr.MeasureString($script:statusText,$cf).Height)/2))')
+    // ---- close box: a quiet X, drawn in the reserved top-right corner ----
+    // It is deliberately muted: it must read as dismissible, not as a second
+    // call to action competing with the status chip.
+    lines.push('  $xp=RR $xL $xT $xS $xS ([int](6*$k))')
+    lines.push('  if($script:xDown){')
+    lines.push('    $xb=New-Object System.Drawing.SolidBrush($script:tintText)')
+    lines.push('    $gr.FillPath($xb,$xp); $xb.Dispose()')
+    lines.push('    $xc=[System.Drawing.Color]::FromArgb(24,28,34)')
+    lines.push('  } elseif($script:xHover){')
+    lines.push('    $xb=New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(48,255,255,255))')
+    lines.push('    $gr.FillPath($xb,$xp); $xb.Dispose()')
+    lines.push('    $xc=$script:tintText')
+    lines.push('  } else {')
+    lines.push('    $xb=New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(18,255,255,255))')
+    lines.push('    $gr.FillPath($xb,$xp); $xb.Dispose()')
+    lines.push('    $xc=$script:cBrand')
+    lines.push('  }')
+    lines.push('  $xpen=New-Object System.Drawing.Pen($xc,[Math]::Max(1,[int](1.4*$k)))')
+    lines.push('  $xi=[int](6*$k)')
+    lines.push('  $gr.DrawLine($xpen,($xL+$xi),($xT+$xi),($xL+$xS-$xi),($xT+$xS-$xi))')
+    lines.push('  $gr.DrawLine($xpen,($xL+$xS-$xi),($xT+$xi),($xL+$xi),($xT+$xS-$xi))')
+    lines.push('  $xpen.Dispose()')
     // ---- headline: the conversation's name, one line, ellipsised ----
     //
     // Drew unbounded before, which meant a long title simply ran past the card's
@@ -1413,7 +1449,41 @@ export function buildScript(cfg, title, body, tone = 'ok') {
     // One handler on the form is enough now that the whole card is painted: the
     // old per-Label handlers existed only because Labels swallow mouse events
     // from their parent, and there are no child controls left to swallow them.
-    lines.push('$f.Add_Click({ Send-Jump; FocusDsh; $f.Close() })')
+    // The click is split: the X closes quietly (no jump, no DSH focus),
+    // everywhere else keeps the old jump-then-focus-then-close path. Using
+    // Control::MousePosition + PointToClient matters: WinForms' Click event
+    // carries plain EventArgs (no $.Location), so a MouseEventArgs-style
+    // hit test would silently read an empty point and never hit the X.
+    // Mouse feedback for the close box: the pointer turns into a hand over it,
+    // the box brightens and its strokes take the accent colour (hover), and a
+    // left press inverts it to a solid accent chip with dark strokes (pressed).
+    // These handlers repaint directly with $f.Invalidate() so they also work on
+    // a parked card (timeout=0), which has no tickr timer. MouseUp performs the
+    // quiet close; the old click path (jump + focus) stays for the card body.
+    lines.push('$f.Add_MouseMove({')
+    lines.push('  $mp=XPoint; $over=XHit $mp[0] $mp[1]')
+    lines.push('  $f.Cursor=if($over){[System.Windows.Forms.Cursors]::Hand}else{[System.Windows.Forms.Cursors]::Default}')
+    lines.push('  if($over -ne $script:xHover){ $script:xHover=$over; $f.Invalidate() }')
+    lines.push('})')
+    lines.push('$f.Add_MouseLeave({ if($script:xHover -or $script:xDown){ $script:xHover=$false; $script:xDown=$false; $f.Cursor=[System.Windows.Forms.Cursors]::Default; $f.Invalidate() } })')
+    lines.push('$f.Add_MouseDown({')
+    lines.push('  if($_.Button -ne [System.Windows.Forms.MouseButtons]::Left){ return }')
+    lines.push('  $mp=XPoint')
+    lines.push('  if(XHit $mp[0] $mp[1]){ $script:xDown=$true; $f.Cursor=[System.Windows.Forms.Cursors]::Hand; $f.Invalidate() }')
+    lines.push('})')
+    lines.push('$f.Add_MouseUp({')
+    lines.push('  if($_.Button -ne [System.Windows.Forms.MouseButtons]::Left){ return }')
+    lines.push('  if(-not $script:xDown){ return }')
+    lines.push('  $script:xDown=$false')
+    lines.push('  $mp=XPoint')
+    lines.push('  if(XHit $mp[0] $mp[1]){ $script:xHover=$false; $f.Close(); return }')
+    lines.push('  $f.Invalidate()')
+    lines.push('})')
+    lines.push('$f.Add_Click({')
+    lines.push('  $mp=XPoint')
+    lines.push('  if(XHit $mp[0] $mp[1]){ return }')
+    lines.push('  Send-Jump; FocusDsh; $f.Close()')
+    lines.push('})')
     lines.push('$gfx.Dispose()')
     // Re-assert the band on a timer, and walk past invisible windows.
     //

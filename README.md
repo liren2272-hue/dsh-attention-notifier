@@ -34,7 +34,9 @@ DeepSeek Harness 插件：agent 卡在等你决策时、以及任务结束时，
 
 标题的可用宽度是**到状态胶囊左边为止**，所以无论会话名多长，文字都不会压到右边的「已完成」。
 
-一个没人回答的问题是永远不恢复的任务。所以提问类卡片会按 `remindEveryMs` 重复提醒，最多 `maxReminders` 次。
+一个没人回答的问题是永远不恢复的任务。但黄色（待你决定）卡片**不会**再弹第二次——第一张会一直留在角落等你回应，
+重复的那张橙色卡片只会盖住它、不带来新信息。需要恢复旧行为时把 `remindOnAsk` 设为 `true`，此时才按 `remindEveryMs` / `maxReminders` 重复提醒。
+卡片右上角的 **×** 有悬停高亮（光标变手型、底色变亮）和按下反馈（变实心强调色），只关闭这张卡片、不会跳回 DSH 窗口；点卡片其他位置仍然是「跳转并唤起 DSH」。
 
 ## 安装
 
@@ -103,8 +105,9 @@ git clone https://github.com/liren2272-hue/dsh-attention-notifier.git
 | `includeSummary` | `true` | 结束卡片带上最后一条回复的摘要 |
 | `askGuidance` | `true` | 往系统提示词里注入「何时该问用户」的规则 |
 | `minIntervalMs` | `4000` | 同类通知的合并窗口（连问三次只响一次） |
-| `remindEveryMs` | `120000` | 无人回应时的重复提醒间隔 |
-| `maxReminders` | `3` | 最多重复提醒几次，然后停止 |
+| `remindOnAsk` | `false` | 黄色（提问/批准）卡片是否重复弹第二次；默认关闭，第一张会一直等你回应。设 `true` 恢复旧提醒 |
+| `remindEveryMs` | `120000` | `remindOnAsk: true` 时的重复提醒间隔 |
+| `maxReminders` | `3` | `remindOnAsk: true` 时最多重复提醒几次 |
 | `focusProcess` | `'DeepSeek Harness'` | 点击卡片时唤起哪个进程（按**进程名**匹配，不是窗口标题）。窗口自己隐藏时（关到托盘）`MainWindowHandle` 是 0，旧实现在这里直接什么也不做；现在按进程枚举它的所有顶层窗口来挑，隐藏的用程序自身的「二次启动」路径唤醒，唤醒回来的是可交互的页面，不是定格的最后一帧 |
 | `raiseLog` | `%TEMP%\dsh-attention\raise.log` | 唤起窗口时写了什么：挑中哪个窗口、有没有唤醒、有没有拿到前台。唤起失败没有任何现象（卡片照样关闭），这个文件是区分「没找到可唤起的窗口」和「窗口本来就在」的唯一依据；写成 `''` 关闭 |
 | `jump` | `true` | 点击卡片时把页面切到打断你的那个会话 |
