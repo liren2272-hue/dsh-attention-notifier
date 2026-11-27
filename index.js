@@ -16,7 +16,7 @@
  */
 import { ring, DEFAULT_RAISE_LOG } from './notify.js'
 import { POPUP_PRESETS, POPUP_TONES, popup } from './popup.js'
-import { appendFileSync, mkdirSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
@@ -24,6 +24,7 @@ import { randomUUID } from 'node:crypto'
 export const inject = ['timer']
 
 export const DEFAULT_TRACE = join(tmpdir(), 'dsh-attention', 'trace.log')
+export const DEFAULT_CLICK_MARKERS = join(tmpdir(), 'dsh-attention', 'click-markers')
 
 /** How long a card click may sit unclaimed before its jump target is dropped. */
 const JUMP_TTL_MS = 60_000
@@ -661,6 +662,45 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
+   * Resolve the navigable conversation id for a jump card.
+   *
+   * A host upgrade changed `request.agent.id` from the conversation id
+   * (`session-<uuid>`) to the ROLE key `root`. Passing that to the page's
+   * `workspace.openSession(id)` focuses the DSH window but cannot switch
+   * conversation — the symptom "it only came back to DSH". The authoritative
+   * conversation id now lives on `agent.session.id`; other plugins read the
+   * same field. Keep the ROLE id for the root gate and pending keys, and use
+   * this resolved id only for the jump/offerJump target.
+   *
+   * Preference order: a `session-*` shaped agent.id, then agent.session.id,
+   * then the initiator's `session.id`, then any `session-*` initiator id.
+   * Falls back to the raw agent.id/initiator id so the pre-upgrade shape and
+   * the harness mock (id 'root', no session) keep working.
+   *
+   * @param {object|undefined} agent
+   * @returns {string|undefined}
+   */
+  function resolveJumpSessionId(agent) {
+    const isSession = (v) => typeof v === 'string' && v.startsWith('session-')
+    const id = agent?.id
+    const sid = agent?.session?.id
+    const initiator = ctx.get?.('agents')?.currentInitiator?.()
+    const iid = initiator?.id
+    const isid = initiator?.session?.id
+    let resolved, which
+    if (isSession(id)) { resolved = id; which = 'agent.id' }
+    else if (isSession(sid)) { resolved = sid; which = 'agent.session.id' }
+    else if (isSession(isid)) { resolved = isid; which = 'initiator.session.id' }
+    else if (isSession(iid)) { resolved = iid; which = 'initiator.id' }
+    else { resolved = id ?? isid ?? sid ?? iid ?? undefined; which = 'fallback' }
+    once(`jumpSession:${which}:${String(id)}`, 'jump:session-resolved', {
+      rawId: id, sessionId: resolved, source: which,
+      hasSession: sid !== undefined, initiatorId: iid, initiatorSessionId: isid,
+    })
+    return resolved
+  }
+
+  /**
    * Resolve the conversation's NAME for a card from the live session.
    *
    * The card's headline used to print the fixed product label "DeepSeek
@@ -1013,6 +1053,39 @@ export function apply(ctx, rawConfig) {
                 res.end()
                 return
               }
+              // Consume click markers left by detached cards. A cookie-less
+              // PowerShell cannot pass the host's route-level auth on /click,
+              // so the card writes a marker file instead. This authenticated
+              // handler is the one place the page does reach, so the marker is
+              // turned into a claim here.
+              try {
+                if (existsSync(DEFAULT_CLICK_MARKERS)) {
+                  for (const name of readdirSync(DEFAULT_CLICK_MARKERS)) {
+                    if (!name.endsWith('.marker')) continue
+                    const markerPath = join(DEFAULT_CLICK_MARKERS, name)
+                    let token = ''
+                    try { token = readFileSync(markerPath, 'utf8').trim() } catch { continue }
+                    try { unlinkSync(markerPath) } catch { /* already consumed */ }
+                    const entry = jumps.get(token)
+                    if (entry === undefined) {
+                      write('click:marker:invalid', { jumpId: token, why: 'unknown' })
+                      continue
+                    }
+                    const age = now() - entry.at
+                    if (age < 0 || age > entry.ttl) {
+                      jumps.delete(token)
+                      write('click:marker:invalid', { jumpId: token, age, why: 'expired' })
+                      continue
+                    }
+                    jumps.delete(token)
+                    claimed.push({ jumpId: token, sessionId: entry.sessionId, at: now() })
+                    while (claimed.length > 8) claimed.shift()
+                    jumpStats.clicked += 1
+                    write('click:marker', { jumpId: token, sessionId: entry.sessionId, age, ...jumpStats })
+                  }
+                }
+              } catch { /* marker consumption must never break /pending */ }
+
               // Broadcast, not hand-out: the newest fresh claim is answered to
               // every asking page, and the page dedupes on `jumpId`. Expiry is
               // short (CLAIM_TTL_MS) so a claim cannot keep following the user
@@ -1188,9 +1261,10 @@ export function apply(ctx, rawConfig) {
             // send the click to whichever conversation happened to be focused.
             // `exec.agent` is absent for scheduled runs, so the initiator is the
             // fallback rather than the other way round.
+            const jumpAgent = exec?.agent ?? ctx.get?.('agents')?.currentInitiator?.()
             const sessionId = options.jump === false || cfg.jump === false
               ? undefined
-              : exec?.agent?.id ?? ctx.get?.('agents')?.currentInitiator?.()?.id
+              : resolveJumpSessionId(jumpAgent)
             delete options.jump
             // A test card should look like the card it is standing in for, and
             // the real cards are headed by the conversation's name. So when the
@@ -1211,7 +1285,7 @@ export function apply(ctx, rawConfig) {
             // `jump: false` still belongs to this conversation, it just cannot
             // be clicked.
             if (options.title === undefined) {
-              const named = resolveSessionName(exec?.agent?.id ?? ctx.get?.('agents')?.currentInitiator?.()?.id)
+              const named = resolveSessionName(resolveJumpSessionId(exec?.agent ?? ctx.get?.('agents')?.currentInitiator?.()))
               if (named !== '') options.title = named
             }
             // The token table lives beside the route that consumes it, so it is
@@ -1248,6 +1322,7 @@ export function apply(ctx, rawConfig) {
     reached('user-questions/request', request)
     const questions = Array.isArray(request?.questions) ? request.questions : []
     const agentId = request?.agent?.id
+    const jumpSessionId = resolveJumpSessionId(request?.agent)
     if (cfg.notifyOnQuestion && questions.length > 0 && (agentId === undefined || isRootAgent(agentId))) {
       const heading = questions.length === 1
         ? (questions[0].header ?? questions[0].question ?? '需要你选择')
@@ -1258,8 +1333,8 @@ export function apply(ctx, rawConfig) {
         .join(' / ')
       const body = clip(detail || heading)
       const key = `question:${agentId ?? 'any'}`
-      if (shouldNotify(key)) notify(cfg.title, `需要你选择：${body}`, 'ask', agentId)
-      trackPending(key, body, 'ask', agentId)
+      if (shouldNotify(key)) notify(cfg.title, `需要你选择：${body}`, 'ask', jumpSessionId)
+      trackPending(key, body, 'ask', jumpSessionId)
       request?.signal?.addEventListener?.('abort', () => cancelPending(key), { once: true })
     }
     return next().finally(() => {
@@ -1271,6 +1346,7 @@ export function apply(ctx, rawConfig) {
   ctx.on('approval/request', (request, next) => {
     reached('approval/request', request)
     const agentId = request?.agent?.id
+    const jumpSessionId = resolveJumpSessionId(request?.agent)
     if (cfg.notifyOnApproval && (agentId === undefined || isRootAgent(agentId))) {
       const display = request?.displayReason
       const localized = display && typeof display === 'object'
@@ -1278,8 +1354,8 @@ export function apply(ctx, rawConfig) {
         : undefined
       const reason = clip(localized ?? request?.reason ?? request?.toolName ?? '需要你批准', 160)
       const key = `approval:${agentId ?? 'any'}`
-      if (shouldNotify(key)) notify(cfg.title, `需要你批准：${reason}`, 'ask', agentId)
-      trackPending(key, reason, 'ask', agentId)
+      if (shouldNotify(key)) notify(cfg.title, `需要你批准：${reason}`, 'ask', jumpSessionId)
+      trackPending(key, reason, 'ask', jumpSessionId)
       request?.signal?.addEventListener?.('abort', () => cancelPending(key), { once: true })
     }
     return next().finally(() => {

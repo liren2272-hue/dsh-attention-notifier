@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os'
 import { renderMarkdown } from './markdown.js'
 
 export const DEFAULT_LOG = join(tmpdir(), 'dsh-attention', 'notify.log')
+export const DEFAULT_CLICK_MARKERS = join(tmpdir(), 'dsh-attention', 'click-markers')
 /**
  * Where the window raiser writes what it actually found.
  *
@@ -694,9 +695,19 @@ export function buildScript(cfg, title, body, tone = 'ok') {
     // the latter initializes PowerShell's web cmdlet machinery (hundreds of
     // ms) on first use, and this runs synchronously on the UI thread.
     const jump = String(cfg.jumpUrl ?? '').replace(/'/g, "''")
+    // The detached card cannot POST through the host's route-level auth. It
+    // drops a one-line marker file instead; the authenticated /pending handler
+    // consumes it and turns it into the same claim the old /click route made.
+    // The HTTP POST stays for older hosts that still allow it. Marker write is
+    // nested in its own try so it can never suppress the POST, and vice versa.
+    const clickToken = jump === '' ? '' : jump.split('/').pop()
+    const markerDir = DEFAULT_CLICK_MARKERS.replace(/'/g, "''")
+    const markerWrite = jump === ''
+      ? ''
+      : `try { if(-not(Test-Path '${markerDir}')){[void](New-Item -ItemType Directory -Path '${markerDir}' -Force)}; [IO.File]::WriteAllText((Join-Path '${markerDir}' '${clickToken}.marker'), '${clickToken}') } catch {}; `
     lines.push(jump === ''
       ? 'function Send-Jump{}'
-      : `function Send-Jump(){ try { $r=[System.Net.HttpWebRequest]::Create('${jump}'); $r.Method='POST'; $r.Timeout=2000; $resp=$r.GetResponse(); $resp.Close() } catch {} }`)
+      : `function Send-Jump(){ try { $r=[System.Net.HttpWebRequest]::Create('${jump}'); ${markerWrite}$r.Method='POST'; $r.Timeout=2000; $resp=$r.GetResponse(); $resp.Close() } catch {} }`)
     lines.push('Add-Type -AssemblyName System.Windows.Forms')
     lines.push('Add-Type -AssemblyName System.Drawing')
     // A Form subclass that shows without taking the foreground. Both halves are

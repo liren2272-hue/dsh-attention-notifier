@@ -147,11 +147,13 @@ git clone https://github.com/liren2272-hue/dsh-attention-notifier.git
 所以这条链是三段式的：
 
 1. 响铃时生成一个绑定 sessionId 的一次性 UUID token，注册到 `/dsh-attention/click/<token>`
-2. 卡片被点击时 POST 这个 token 给宿主路由
-3. 插件的浏览器半边（`client.js`）轮询 `/dsh-attention/pending`，拿到 sessionId 后调用 `uiWorkspace.openSession`
+2. 卡片被点击时把 token 写进临时目录的 marker 文件（同时仍尝试 POST 旧路由，兼容允许它的宿主）
+3. 插件的浏览器半边（`client.js`）轮询 `/dsh-attention/pending`；这个已鉴权的处理器消费 marker，拿到 sessionId 后调用 `uiWorkspace.openSession`
 
-token 本身就是 capability——发起请求的是一个没有浏览器身份的分离 PowerShell，而响应不带数据（204），
-所以伪造请求只能消耗掉伪造者已经在屏幕上看见过的 token。
+为什么用 marker 文件：宿主 webServer 对路由做全局鉴权，分离出来的 PowerShell 卡片没有浏览器 cookie/token，
+POST `/click` 会被拦在插件 handler 之前（401），导致点击只唤起窗口却不切会话。marker 文件走磁盘、不经过那条鉴权，
+而 `/pending` 本来就是页面带同源凭据访问的，所以在那里消费最稳。token 本身就是 capability——
+发起请求的是一个没有浏览器身份的分离 PowerShell，而响应不带数据（204），所以伪造请求只能消耗掉伪造者已经在屏幕上看见过的 token。
 
 ### 为什么挂 `prepend`
 
